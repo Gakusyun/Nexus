@@ -43,11 +43,6 @@ impl Render for NexusApp {
             .on_key_down(cx.listener(handle_keys))
             .child(title_bar(strings, self.settings_open, window, cx))
             .child(self.body(strings, &theme, window, cx))
-            // Floating, and added *before* the cards so a modal always wins the stack. There is at
-            // most one notice at a time; a second one replaces the first (see `NexusApp::warn`).
-            .when_some(self.notice.clone(), |element, notice| {
-                element.child(nexus_look::Toast::new("notice", notice).build(window, cx))
-            })
             .when_some(self.confirm.as_ref(), |element, confirm| {
                 element.child(confirm_dialog(confirm, strings, &theme, window, cx))
             })
@@ -109,6 +104,7 @@ impl NexusApp {
             .child(command_bar(self, strings, theme, window, cx))
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -120,7 +116,13 @@ impl NexusApp {
                         element.child(banner)
                     })
                     .child(filter_bar(self, strings, theme, cx))
-                    .child(list),
+                    .child(list)
+                    // The notice floats over this column rather than living in it, and is added
+                    // last so it paints above the rows. There is at most one at a time; a second
+                    // replaces the first (see `NexusApp::warn`).
+                    .when_some(self.notice.clone(), |element, notice| {
+                        element.child(nexus_look::Toast::new("notice", notice).build(window, cx))
+                    }),
             )
             .into_any_element()
     }
