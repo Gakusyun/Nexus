@@ -3363,7 +3363,7 @@ dependencies = [
 [[package]]
 name = "nexus-look"
 version = "0.1.0"
-source = "git+ssh://git@github.com/Gakusyun/Nexus-look.git?branch=main#82314c5462162dcfc8623fd162c302bd3d450cae"
+source = "git+ssh://git@github.com/Gakusyun/Nexus-look.git?branch=main#490df93459b48d5c03a4d3eb72a4bfedc6113c3b"
 dependencies = [
  "gpui-ce",
 ]

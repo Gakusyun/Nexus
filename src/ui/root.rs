@@ -43,6 +43,11 @@ impl Render for NexusApp {
             .on_key_down(cx.listener(handle_keys))
             .child(title_bar(strings, self.settings_open, window, cx))
             .child(self.body(strings, &theme, window, cx))
+            // Floating, and added *before* the cards so a modal always wins the stack. There is at
+            // most one notice at a time; a second one replaces the first (see `NexusApp::warn`).
+            .when_some(self.notice.clone(), |element, notice| {
+                element.child(nexus_look::Toast::new("notice", notice).build(window, cx))
+            })
             .when_some(self.confirm.as_ref(), |element, confirm| {
                 element.child(confirm_dialog(confirm, strings, &theme, window, cx))
             })
@@ -111,7 +116,7 @@ impl NexusApp {
                     .gap(px(13.0))
                     .px(px(PAGE_PADDING))
                     .py(px(nexus_look::space::XL))
-                    .when_some(banner(self, strings, theme), |element, banner| {
+                    .when_some(engine_banner(self, strings, theme), |element, banner| {
                         element.child(banner)
                     })
                     .child(filter_bar(self, strings, theme, cx))
@@ -350,8 +355,12 @@ fn filter_bar(
 
 // -------------------------------------------------------------------------- banner
 
-/// Engine failures and transient notices share one strip under the command bar.
-fn banner(this: &NexusApp, strings: &Strings, theme: &Theme) -> Option<AnyElement> {
+/// The engine is gone, and it is going to stay gone until the user does something about it.
+///
+/// It stays *in* the column, unlike the transient notice (`Toast`), because it describes a standing
+/// condition rather than an answer to something just typed: it is part of the page until the engine
+/// answers again, and it carries a long reason that has to be readable while the list is used.
+fn engine_banner(this: &NexusApp, strings: &Strings, theme: &Theme) -> Option<AnyElement> {
     if let Engine::Failed(reason) = &this.engine {
         let (danger, wash, muted) = (theme.danger, theme.danger_wash, theme.text_muted);
         return Some(
@@ -385,32 +394,6 @@ fn banner(this: &NexusApp, strings: &Strings, theme: &Theme) -> Option<AnyElemen
                                 .text_color(muted)
                                 .child(reason.clone()),
                         ),
-                )
-                .into_any_element(),
-        );
-    }
-
-    if let Some(notice) = &this.notice {
-        let (warning, muted) = (theme.warning, theme.text_muted);
-        return Some(
-            div()
-                .flex()
-                .flex_row()
-                .flex_none()
-                .items_center()
-                .gap(px(9.0))
-                .px(px(13.0))
-                .py(px(9.0))
-                .rounded(px(11.0))
-                .bg(theme.surface)
-                .border_1()
-                .border_color(theme.border)
-                .child(icon("icons/alert.svg", 14.0, warning))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(muted)
-                        .child(notice.clone()),
                 )
                 .into_any_element(),
         );
