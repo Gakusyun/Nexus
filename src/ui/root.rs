@@ -18,8 +18,9 @@ use crate::model::fmt_speed;
 use crate::state::{AddField, Engine, Field, Filter, NexusApp};
 use nexus_look::Theme;
 
-/// Horizontal page gutter. Also used to derive the width available to the URL field.
-pub const PAGE_PADDING: f32 = 24.0;
+/// The page's horizontal gutter. Taken from the language rather than chosen here, so a screenshot
+/// of Nexus and a screenshot of any other Nexus-look app line up as they should.
+pub const PAGE_PADDING: f32 = nexus_look::space::XL;
 const GAP_BUTTON: f32 = 12.0;
 
 impl Render for NexusApp {
@@ -96,15 +97,26 @@ impl NexusApp {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .gap(px(13.0))
-            .px(px(PAGE_PADDING))
-            .pb(px(PAGE_PADDING))
+            // The command bar is a toolbar, so it spans the window and the gutter below it applies
+            // to the *content* only. A strip inset by the page gutter is not a toolbar and not a
+            // card — it is a white rectangle floating in the middle of the page, which is exactly
+            // how it read.
             .child(command_bar(self, strings, theme, window, cx))
-            .when_some(banner(self, strings, theme), |element, banner| {
-                element.child(banner)
-            })
-            .child(filter_bar(self, strings, theme, cx))
-            .child(list)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .gap(px(13.0))
+                    .px(px(PAGE_PADDING))
+                    .py(px(nexus_look::space::XL))
+                    .when_some(banner(self, strings, theme), |element, banner| {
+                        element.child(banner)
+                    })
+                    .child(filter_bar(self, strings, theme, cx))
+                    .child(list),
+            )
             .into_any_element()
     }
 }
@@ -161,10 +173,14 @@ fn command_bar(
         .flex_row()
         .items_center()
         .flex_none()
+        .w_full()
         .gap(px(GAP_BUTTON))
         .px(px(PAGE_PADDING))
         .py(px(nexus_look::space::MD))
-        .bg(theme.surface)
+        // No fill of its own: the toolbar is the window, held apart from the list below by one
+        // hairline. A `surface` strip put a white band across the top of a grey page.
+        .border_b_1()
+        .border_color(theme.border_soft)
         .child(div().flex_1().min_w(px(0.0)).child(this.input.clone()))
         .child(submit)
         .child(advanced)
