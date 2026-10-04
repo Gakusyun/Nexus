@@ -51,6 +51,12 @@ TitleBar 40  →  Tabs 40（进行中 / 已完成 / 全部）  →  命令栏（
 10. **能从 `tasks` 算出来的东西不要存成字段**（速度合计就是这么来的）。
 11. **设置页是草稿式的，只有保存才落盘**：控件改的是 `draft`，渲染读 `active_settings()`；
     `commit_settings()` 才并回 `settings` 并同步写一次库。
+12. **输入框只有一种：`nexus_look::TextInput`**。它自己持有 buffer、焦点、光标和 IME 桥，
+    所以 `NexusApp` 里只有 `Entity<TextInput>` —— 没有 `TextEdit`、没有裸的 `FocusHandle`、
+    也没有 `Field` 枚举。Enter / Escape 走 `on_submit` / `on_dismiss`，接到「这层弹窗的规则」
+    上（新建下载：Enter 只在 URL 行提交；设置框：Esc 先关字体选择器再关卡片）。根视图的
+    `handle_keys` 只在**没有任何输入框持有焦点**时才开口 —— 否则同一个按键会把同一个动作
+    跑两遍（关掉弹窗，再关掉它下面那层）。
 
 ## 4. 桌面端的坑
 

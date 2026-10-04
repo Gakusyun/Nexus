@@ -5,15 +5,13 @@
 //! persistence and `cx.notify()` stay in one place.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AppContext, Bounds, Context, EntityInputHandler, FocusHandle, Font, FontFallbacks,
-    Entity, PathPromptOptions, Pixels, Subscription, UTF16Selection, Window, px,
+    App, AppContext, Context, Entity, Font, FontFallbacks, PathPromptOptions, Subscription, Window,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,13 +20,11 @@ use crate::i18n::{self, Strings};
 use crate::model::{Status, Task, fmt_size, total_speed};
 use crate::settings::{Language, Settings, ThemeMode, font_stack};
 use crate::store::{Event, Store};
-use crate::ui::text_field;
 // The stored `ThemeMode` is this app's — it has a serde shape for the legacy importer. The
 // library's has the same three names and no persistence, which is the right split: how a
 // preference is spelled in a database file is not a design-language decision.
 use nexus_look::ThemeMode as LookMode;
-use nexus_look::widgets::text_edit::{byte_to_utf16, one_line, utf16_to_byte};
-use nexus_look::{Look, TextEdit, TextInput};
+use nexus_look::{Look, TextInput};
 
 /// How often we ask aria2 for fresh numbers.
 const POLL: Duration = Duration::from_millis(500);
@@ -49,26 +45,10 @@ const DATABASE: &str = "nexus.db";
 const DELETE_TRIES: u32 = 6;
 const DELETE_RETRY: Duration = Duration::from_millis(250);
 
-/// Which editable field a keystroke, a click or an input-method event belongs to.
-///
-/// The platform only ever knows "the view", so the three single-line fields this app owns have to
-/// be told apart by whoever handles the event — the focused field's `FocusHandle` is the only
-/// thing that says which one that is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Field {
-    /// The font family list.
-    Font,
-    /// The font picker's filter.
-    FontSearch,
-    /// The engine's user agent.
-    UserAgent,
-    /// The engine's proxy.
-    Proxy,
-    /// A box in the add-download dialog.
-    Add(AddField),
-}
-
 /// The editable boxes the add-download dialog owns.
+///
+/// `AddField` is an index rather than a name for a buffer: the dialog owns one library input per
+/// variant (see [`AddDialog`]), so adding a box means adding a variant and an entry here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AddField {
     Uri,
@@ -92,48 +72,74 @@ impl AddField {
 
 /// The open add-download dialog.
 ///
-/// It owns the per-download choices for one task. The buffers are indexed by [`AddField`], so a
-/// field is added by extending the enum and the array, not by another struct field and focus
-/// handle. The whole dialog is dropped when it closes.
+/// It owns the per-download choices for one task. The boxes are the library's `TextInput`s,
+/// indexed by [`AddField`], so a field is added by extending the enum and the array — the widget
+/// brings its own buffer, focus handle, caret and IME bridge, and the dialog only has to say where
+/// each box lives. The whole dialog is dropped when it closes, boxes and all.
 pub struct AddDialog {
-    edits: [TextEdit; 6],
-    focuses: [FocusHandle; 6],
+    boxes: [Entity<TextInput>; 6],
     pub connections: u32,
     /// This download's `max-download-limit`; `0` is unlimited.
     pub speed_limit: u64,
 }
 
 impl AddDialog {
-    fn new(cx: &mut Context<NexusApp>) -> Self {
+    fn new(strings: &Strings, cx: &mut Context<NexusApp>) -> Self {
+        let boxes = std::array::from_fn(|index| {
+            let which = AddField::ALL[index];
+            let placeholder = placeholder_for(which, strings);
+            // Enter queues from the URL line and nowhere else: the other boxes are steps on the
+            // way to it, and a half-filled form must not start a download because the caret was
+            // sitting in the wrong place.
+            let submit = (which == AddField::Uri).then(|| {
+                cx.listener(|this, _text: &str, window, cx| this.start_add_download(window, cx))
+            });
+            let dismiss =
+                NexusApp::dismissal(cx, |this, window, cx| this.close_add_dialog(window, cx));
+            cx.new(move |cx| {
+                let field = TextInput::new(cx, placeholder);
+                let field = if let Some(submit) = submit {
+                    field.on_submit(submit)
+                } else {
+                    field
+                };
+                field.on_dismiss(dismiss)
+            })
+        });
         Self {
-            edits: std::array::from_fn(|_| TextEdit::default()),
-            focuses: std::array::from_fn(|_| cx.focus_handle()),
+            boxes,
             connections: 0,
             speed_limit: 0,
         }
     }
 
-    pub fn edit(&self, which: AddField) -> &TextEdit {
-        &self.edits[which as usize]
+    /// The box itself: a view paints it as a child, exactly as it paints one in the settings sheet.
+    pub fn input(&self, which: AddField) -> &Entity<TextInput> {
+        &self.boxes[which as usize]
     }
 
-    pub fn focus(&self, which: AddField) -> &FocusHandle {
-        &self.focuses[which as usize]
+    /// What is typed in a box, for the code that turns the dialog into a request.
+    pub fn text(&self, which: AddField, cx: &App) -> String {
+        self.boxes[which as usize].read(cx).text().to_string()
     }
 
-    pub fn text(&self, which: AddField) -> &str {
-        self.edit(which).text()
+    /// Fill a box — opening the dialog, or the folder picker answering with a path.
+    fn set(&mut self, which: AddField, text: impl Into<String>, cx: &mut Context<NexusApp>) {
+        let text = text.into();
+        self.boxes[which as usize].update(cx, |field, cx| field.set_text(text, cx));
     }
+}
 
-    fn set(&mut self, which: AddField, text: impl Into<String>) {
-        self.edits[which as usize].set(text);
-    }
-
-    /// Which box currently holds the caret, if any.
-    fn focused(&self, window: &Window) -> Option<AddField> {
-        AddField::ALL
-            .into_iter()
-            .find(|which| self.focus(*which).is_focused(window))
+/// The placeholder a dialog box starts with. A localized app can switch language with the dialog
+/// closed, so this is a function of the language rather than something stored on the box.
+fn placeholder_for(which: AddField, strings: &Strings) -> &'static str {
+    match which {
+        AddField::Uri => strings.placeholder,
+        AddField::Dir => strings.dir_placeholder,
+        AddField::Name => strings.file_name_placeholder,
+        AddField::UserAgent => strings.user_agent_placeholder,
+        AddField::Proxy => strings.proxy_placeholder,
+        AddField::Referer => strings.referer_placeholder,
     }
 }
 
@@ -203,7 +209,6 @@ pub struct NexusApp {
     /// its focus handle, its caret and its IME bridge, so there is nothing left for the app to
     /// hold on its behalf.
     pub input: Entity<TextInput>,
-    pub caret_on: bool,
     pub notice: Option<String>,
     /// Mirrors the platform window state, refreshed by `observe_window_bounds`, so the
     /// title bar can swap maximise for restore.
@@ -221,22 +226,16 @@ pub struct NexusApp {
     draft: Option<Settings>,
     /// What is typed in the font box, exactly as typed. Kept apart from `settings.font` so
     /// the trimming that goes into the database cannot move the caret while the user types.
-    pub font_draft: TextEdit,
-    pub font_focus: FocusHandle,
+    pub font_input: Entity<TextInput>,
     /// Whether the font picker's panel is showing.
     pub font_menu_open: bool,
     /// The picker's filter box.
-    pub font_query: TextEdit,
-    pub search_focus: FocusHandle,
+    pub font_search: Entity<TextInput>,
     /// What is typed in the engine's user-agent box, kept apart from `settings.user_agent` for
-    /// the same reason as `font_draft`: trimming must not move the caret while typing.
-    pub ua_draft: TextEdit,
-    pub ua_focus: FocusHandle,
+    /// the same reason as `font_input`: trimming must not move the caret while typing.
+    pub ua_input: Entity<TextInput>,
     /// Likewise for the proxy box.
-    pub proxy_draft: TextEdit,
-    pub proxy_focus: FocusHandle,
-    /// The field a selection drag is currently extending, if any.
-    pub dragging: Option<Field>,
+    pub proxy_input: Entity<TextInput>,
     /// The font list, read from the platform once because the settings page needs it on
     /// every frame while it is open.
     pub fonts: Vec<String>,
@@ -320,25 +319,51 @@ impl NexusApp {
             .unwrap_or(0)
             .max(store.highest_seq())
             + 1;
-        let font_focus = cx.focus_handle();        let search_focus = cx.focus_handle();
-        let mut font_draft = TextEdit::default();
-        font_draft.set(settings.font.clone().unwrap_or_default());
-        let font_query = TextEdit::default();
-        let ua_focus = cx.focus_handle();
-        let proxy_focus = cx.focus_handle();
-        let mut ua_draft = TextEdit::default();
-        ua_draft.set(settings.user_agent.clone().unwrap_or_default());
-        let mut proxy_draft = TextEdit::default();
-        proxy_draft.set(settings.proxy.clone().unwrap_or_default());
         let maximized = window.is_maximized();
         // Sorted once: the picker lists them in a stable order and nothing here cares about the
         // platform's.
         let mut fonts = cx.text_system().all_font_names();
         fonts.sort_by_key(|family| family.to_lowercase());
-        // The command bar. The placeholder is the app's, so it is set from the active language
-        // rather than baked into the widget.
-        let placeholder = i18n::Strings::get(settings.language).placeholder;
-        let input = cx.new(|cx| TextInput::new(cx, placeholder).large());
+        // Every box in the app is one of the library's inputs: it owns its buffer, its focus
+        // handle, its caret and its IME bridge, so the app keeps only the entity and the rule for
+        // what Enter and Escape mean here.
+        let strings = i18n::Strings::get(settings.language);
+        let submit_input = cx.listener(|this, _text: &str, _, cx| this.submit(cx));
+        let dismiss_input = Self::dismissal(cx, |this, _, cx| {
+            // Escape at the front door clears the notice, and nothing else.
+            this.notice = None;
+            cx.notify();
+        });
+        let input_placeholder = strings.placeholder;
+        let input = cx.new(move |cx| {
+            TextInput::new(cx, input_placeholder)
+                .large()
+                .on_submit(submit_input)
+                .on_dismiss(dismiss_input)
+        });
+        let font_input = Self::settings_field(cx, strings.font_placeholder, |this, text, _, cx| {
+            this.font_text_changed(text, cx)
+        });
+        // The list of matches is drawn by the sheet, so filtering it needs the sheet to redraw;
+        // the box itself only repaints its own caret.
+        let font_search =
+            Self::settings_field(cx, strings.font_search_placeholder, |_, _, _, cx| {
+                cx.notify()
+            });
+        let ua_input =
+            Self::settings_field(cx, strings.user_agent_placeholder, |this, text, _, cx| {
+                this.ua_text_changed(text, cx)
+            });
+        let proxy_input =
+            Self::settings_field(cx, strings.proxy_placeholder, |this, text, _, cx| {
+                this.proxy_text_changed(text, cx)
+            });
+        let font = settings.font.clone().unwrap_or_default();
+        let user_agent = settings.user_agent.clone().unwrap_or_default();
+        let proxy = settings.proxy.clone().unwrap_or_default();
+        font_input.update(cx, |field, cx| field.set_text(font, cx));
+        ua_input.update(cx, |field, cx| field.set_text(user_agent, cx));
+        proxy_input.update(cx, |field, cx| field.set_text(proxy, cx));
         // Apply the stored palette before the first frame paints.
         Look::update(cx, |look| look.mode = look_mode(settings.theme));
 
@@ -355,7 +380,6 @@ impl NexusApp {
             filter: Filter::All,
             download_dir,
             input,
-            caret_on: true,
             notice: None,
             maximized,
             settings_open: false,
@@ -363,16 +387,11 @@ impl NexusApp {
             add_dialog: None,
             settings,
             draft: None,
-            font_draft,
-            font_focus,
+            font_input,
             font_menu_open: false,
-            font_query,
-            search_focus,
-            ua_draft,
-            ua_focus,
-            proxy_draft,
-            proxy_focus,
-            dragging: None,
+            font_search,
+            ua_input,
+            proxy_input,
             fonts,
             store,
             seen,
@@ -465,10 +484,6 @@ impl NexusApp {
                 };
                 let alive = this
                     .update(cx, |this, cx| {
-                        // The caret rides the poll tick: we repaint this often anyway,
-                        // so blinking costs nothing extra.
-                        this.caret_on = !this.caret_on;
-
                         match snapshot {
                             Some(Ok(snapshot)) => {
                                 this.failures = 0;
@@ -579,24 +594,22 @@ impl NexusApp {
         if self.add_dialog.is_some() {
             return;
         }
-        let mut dialog = AddDialog::new(cx);
+        let strings = self.strings();
+        let mut dialog = AddDialog::new(strings, cx);
         dialog.connections = self.settings.connections.clamp(1, 16);
-        dialog.set(AddField::Uri, self.input.read(cx).text());
-        dialog.set(
-            AddField::Dir,
-            self.download_dir.to_string_lossy().into_owned(),
-        );
-        dialog.set(
-            AddField::UserAgent,
-            self.settings.user_agent.clone().unwrap_or_default(),
-        );
-        dialog.set(
-            AddField::Proxy,
-            self.settings.proxy.clone().unwrap_or_default(),
-        );
-        let uri = dialog.focus(AddField::Uri).clone();
+        // Read, then write: the box's own entity cannot be read and updated in one step, so each
+        // pre-fill gets its own statement.
+        let uri = self.input.read(cx).text().to_string();
+        let dir = self.download_dir.to_string_lossy().into_owned();
+        let user_agent = self.settings.user_agent.clone().unwrap_or_default();
+        let proxy = self.settings.proxy.clone().unwrap_or_default();
+        dialog.set(AddField::Uri, uri, cx);
+        dialog.set(AddField::Dir, dir, cx);
+        dialog.set(AddField::UserAgent, user_agent, cx);
+        dialog.set(AddField::Proxy, proxy, cx);
+        let focus = dialog.input(AddField::Uri).read(cx).focus_handle().clone();
         self.add_dialog = Some(dialog);
-        window.focus(&uri, cx);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -620,8 +633,8 @@ impl NexusApp {
                 return;
             };
             (
-                dialog.text(AddField::Uri).trim().to_string(),
-                dialog.text(AddField::Dir).trim().to_string(),
+                dialog.text(AddField::Uri, cx).trim().to_string(),
+                dialog.text(AddField::Dir, cx).trim().to_string(),
             )
         };
         if uri.is_empty() {
@@ -639,7 +652,7 @@ impl NexusApp {
         } else {
             PathBuf::from(typed_dir)
         };
-        let request = self.dialog_request(&uri, dir);
+        let request = self.dialog_request(cx, &uri, dir);
         let name = request.file_name.clone();
         // Back to the quick bar, ready for the next paste.
         let handle = self.input.read(cx).focus_handle().clone();
@@ -671,9 +684,9 @@ impl NexusApp {
                 }
             };
             if let Some(dir) = picked {
-                this.update(cx, |this, _| {
+                this.update(cx, |this, cx| {
                     if let Some(dialog) = this.add_dialog.as_mut() {
-                        dialog.set(AddField::Dir, dir.to_string_lossy().into_owned());
+                        dialog.set(AddField::Dir, dir.to_string_lossy().into_owned(), cx);
                     }
                 })
                 .ok();
@@ -728,23 +741,27 @@ impl NexusApp {
     }
 
     /// A download from the dialog: the per-task overrides the user chose.
-    fn dialog_request(&self, uri: &str, dir: PathBuf) -> DownloadRequest {
+    fn dialog_request(&self, cx: &App, uri: &str, dir: PathBuf) -> DownloadRequest {
         let Some(dialog) = self.add_dialog.as_ref() else {
             return self.quick_request(uri.to_string(), dir);
         };
         // Retries and timeout stay global; the dialog only overrides what is genuinely per-task.
         let engine = self.engine_options();
+        let name = dialog.text(AddField::Name, cx);
+        let user_agent = dialog.text(AddField::UserAgent, cx);
+        let proxy = dialog.text(AddField::Proxy, cx);
+        let referer = dialog.text(AddField::Referer, cx);
         DownloadRequest {
             uri: uri.to_string(),
             dir: dir.to_string_lossy().into_owned(),
-            file_name: non_empty(dialog.text(AddField::Name)),
-            user_agent: non_empty(dialog.text(AddField::UserAgent)),
+            file_name: non_empty(&name),
+            user_agent: non_empty(&user_agent),
             connections: dialog.connections.clamp(1, 16),
-            proxy: non_empty(dialog.text(AddField::Proxy)),
+            proxy: non_empty(&proxy),
             max_tries: engine.max_tries,
             timeout: engine.timeout,
             speed_limit: dialog.speed_limit,
-            referer: non_empty(dialog.text(AddField::Referer)),
+            referer: non_empty(&referer),
         }
     }
 
@@ -1095,7 +1112,7 @@ impl NexusApp {
         }
         self.draft = Some(self.settings.clone());
         self.settings_open = true;
-        self.load_setting_drafts();
+        self.load_setting_drafts(cx);
         cx.notify();
     }
 
@@ -1123,7 +1140,7 @@ impl NexusApp {
         self.apply_global_settings(cx);
         // A committed language change has to reach the command bar, which is older than the
         // setting it is now quoting.
-        self.sync_placeholder(cx);
+        self.sync_placeholders(cx);
         self.close_settings(window, cx);
     }
 
@@ -1135,7 +1152,7 @@ impl NexusApp {
         // The theme was installed live as a preview; put the stored one back, and put the command
         // bar's placeholder back with it (the language previews the same way the theme does).
         Look::update(cx, |look| look.mode = look_mode(self.settings.theme));
-        self.sync_placeholder(cx);
+        self.sync_placeholders(cx);
         self.close_settings(window, cx);
     }
 
@@ -1144,7 +1161,7 @@ impl NexusApp {
         self.font_menu_open = false;
         // The text boxes are the draft's other half; reload them so a reopened sheet never shows
         // what was typed and then abandoned.
-        self.load_setting_drafts();
+        self.load_setting_drafts(cx);
         // The command bar is the app's default keyboard target. Clicking the gear blurs it (a
         // click landed outside the box), so hand focus back when the sheet closes — otherwise the
         // user would have to click the bar before pasting the next link.
@@ -1153,25 +1170,50 @@ impl NexusApp {
         cx.notify();
     }
 
-    /// Keep the command bar's placeholder in step with the active language.
+    /// Keep every placeholder in step with the active language.
     ///
-    /// The box outlives every settings change — it is the app's front door — so its placeholder
-    /// cannot be a constructor argument that only ever gets read once.
-    fn sync_placeholder(&self, cx: &mut Context<Self>) {
-        let placeholder = self.strings().placeholder;
-        self.input
-            .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+    /// The boxes outlive every settings change — the command bar is the app's front door and the
+    /// sheet's own boxes are rebuilt around the sheet — so a placeholder cannot be a constructor
+    /// argument that only ever gets read once.
+    fn sync_placeholders(&self, cx: &mut Context<Self>) {
+        let strings = self.strings();
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(strings.placeholder, cx)
+        });
+        self.font_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.font_placeholder, cx)
+        });
+        self.font_search.update(cx, |input, cx| {
+            input.set_placeholder(strings.font_search_placeholder, cx)
+        });
+        self.ua_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.user_agent_placeholder, cx)
+        });
+        self.proxy_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.proxy_placeholder, cx)
+        });
+        if let Some(dialog) = self.add_dialog.as_ref() {
+            for which in AddField::ALL {
+                let placeholder = placeholder_for(which, strings);
+                dialog
+                    .input(which)
+                    .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+            }
+        }
     }
 
-    /// Point the three text boxes at the saved settings. Called on open and on close, so the
-    /// buffers never outlive the sheet they belong to.
-    fn load_setting_drafts(&mut self) {
-        self.font_draft
-            .set(self.settings.font.clone().unwrap_or_default());
-        self.ua_draft
-            .set(self.settings.user_agent.clone().unwrap_or_default());
-        self.proxy_draft
-            .set(self.settings.proxy.clone().unwrap_or_default());
+    /// Point the three boxes at the saved settings. Called on open and on close, so a reopened
+    /// sheet never shows what was typed and then abandoned.
+    fn load_setting_drafts(&mut self, cx: &mut Context<Self>) {
+        let font = self.settings.font.clone().unwrap_or_default();
+        let user_agent = self.settings.user_agent.clone().unwrap_or_default();
+        let proxy = self.settings.proxy.clone().unwrap_or_default();
+        self.font_input
+            .update(cx, |input, cx| input.set_text(font, cx));
+        self.ua_input
+            .update(cx, |input, cx| input.set_text(user_agent, cx));
+        self.proxy_input
+            .update(cx, |input, cx| input.set_text(proxy, cx));
     }
 
     /// The active translation table. `'static`, so callers can hold on to a string while
@@ -1187,7 +1229,7 @@ impl NexusApp {
         if draft.language != language {
             draft.language = language;
             // The placeholder previews along with the rest of the sheet.
-            self.sync_placeholder(cx);
+            self.sync_placeholders(cx);
             cx.notify();
         }
     }
@@ -1255,10 +1297,10 @@ impl NexusApp {
             .collect()
     }
 
-    /// The font box was edited. The draft is the source of truth while typing; what lands in
-    /// the pending settings is its trimmed, empty-aware form.
-    pub fn font_text_changed(&mut self, cx: &mut Context<Self>) {
-        let trimmed = self.font_draft.text().trim();
+    /// The font box was edited. What the user typed is the source of truth while typing; what
+    /// lands in the pending settings is its trimmed, empty-aware form.
+    pub fn font_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let trimmed = text.trim();
         let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
         if let Some(draft) = self.draft.as_mut() {
             draft.font = next;
@@ -1267,8 +1309,8 @@ impl NexusApp {
     }
 
     /// The user-agent box was edited. Empty means "keep the built-in agent".
-    pub fn ua_text_changed(&mut self, cx: &mut Context<Self>) {
-        let next = non_empty(self.ua_draft.text());
+    pub fn ua_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let next = non_empty(text);
         if let Some(draft) = self.draft.as_mut() {
             draft.user_agent = next;
         }
@@ -1276,8 +1318,8 @@ impl NexusApp {
     }
 
     /// The proxy box was edited. Empty means "no proxy".
-    pub fn proxy_text_changed(&mut self, cx: &mut Context<Self>) {
-        let next = non_empty(self.proxy_draft.text());
+    pub fn proxy_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let next = non_empty(text);
         if let Some(draft) = self.draft.as_mut() {
             draft.proxy = next;
         }
@@ -1440,136 +1482,71 @@ impl NexusApp {
             .detach();
     }
 
-    // ------------------------------------------------------------------------- text fields
+    // --------------------------------------------------------------------------- text boxes
 
-    /// Read-only access to an editable field, for the callers that only measure or draw.
-    pub fn field(&self, field: Field) -> Option<&TextEdit> {
-        Some(match field {
-            Field::Font => &self.font_draft,
-            Field::FontSearch => &self.font_query,
-            Field::UserAgent => &self.ua_draft,
-            Field::Proxy => &self.proxy_draft,
-            Field::Add(which) => self.add_dialog.as_ref()?.edit(which),
-        })
-    }
-
-    /// The inverse of [`NexusApp::active_field`]: which handle owns a given field. Views need both
-    /// halves to build a box, and keeping the mapping here means a new `Field` variant can only be
-    /// added in one place.
-    pub fn focus_handle(&self, field: Field) -> Option<&FocusHandle> {
-        Some(match field {
-            Field::Font => &self.font_focus,
-            Field::FontSearch => &self.search_focus,
-            Field::UserAgent => &self.ua_focus,
-            Field::Proxy => &self.proxy_focus,
-            Field::Add(which) => self.add_dialog.as_ref()?.focus(which),
-        })
-    }
-
-    pub fn field_mut(&mut self, field: Field) -> Option<&mut TextEdit> {
-        Some(match field {
-            Field::Font => &mut self.font_draft,
-            Field::FontSearch => &mut self.font_query,
-            Field::UserAgent => &mut self.ua_draft,
-            Field::Proxy => &mut self.proxy_draft,
-            Field::Add(which) => &mut self.add_dialog.as_mut()?.edits[which as usize],
-        })
-    }
-
-    /// Which field the platform is talking about, or `None` when nothing is focused.
+    /// One of the sheet's boxes: a library input wired to whatever the sheet does when it changes,
+    /// and to the sheet's own Escape rule.
     ///
-    /// The platform's events carry no field, only the view, so the focused handle is what
-    /// identifies the target. `None` is a real answer now that clicking outside a box blurs it
-    /// (see the `on_mouse_down_out` in `ui::text_field`): an unfocused box must not receive keys
-    /// or input, so callers never fall back to the command bar.
-    pub fn active_field(&self, window: &Window) -> Option<Field> {
-        if self.font_focus.is_focused(window) {
-            return Some(Field::Font);
-        }
-        if self.search_focus.is_focused(window) {
-            return Some(Field::FontSearch);
-        }
-        if self.ua_focus.is_focused(window) {
-            return Some(Field::UserAgent);
-        }
-        if self.proxy_focus.is_focused(window) {
-            return Some(Field::Proxy);
-        }
-        self.add_dialog
-            .as_ref()
-            .and_then(|dialog| dialog.focused(window))
-            .map(Field::Add)
-    }
-
-    /// A press inside a field: put the caret where the click landed and start a selection.
-    pub fn press_field(
-        &mut self,
-        field: Field,
-        along: f32,
-        window: &Window,
+    /// Four boxes share exactly this shape and half of it is easy to leave off — a box with a
+    /// change handler but no dismissal rule still answers Escape, just not the way the sheet
+    /// expects it to.
+    fn settings_field(
         cx: &mut Context<Self>,
-    ) {
-        let index = self.index_for_x(field, along, window);
-        if let Some(edit) = self.field_mut(field) {
-            edit.set_cursor(index, false);
-        }
-        self.dragging = Some(field);
-        cx.notify();
+        placeholder: &'static str,
+        changed: impl Fn(&mut Self, &str, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Entity<TextInput> {
+        let on_change = cx.listener(changed);
+        let on_dismiss =
+            Self::dismissal(cx, |this, window, cx| this.leave_settings_field(window, cx));
+        cx.new(move |cx| {
+            TextInput::new(cx, placeholder)
+                .on_change(on_change)
+                .on_dismiss(on_dismiss)
+        })
     }
 
-    /// Extend a selection while the button is held down.
-    pub fn drag_field(
-        &mut self,
-        field: Field,
-        along: f32,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.dragging != Some(field) {
-            return;
+    /// What Escape means inside a settings box: the font picker first, then the sheet itself.
+    /// One layer at a time — the same rule the root applies when nothing at all is focused.
+    fn leave_settings_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.font_menu_open {
+            self.close_font_menu(window, cx);
+        } else if self.settings_open {
+            self.cancel_settings(window, cx);
         }
-        let index = self.index_for_x(field, along, window);
-        if let Some(edit) = self.field_mut(field) {
-            edit.set_cursor(index, true);
-        }
-        cx.notify();
     }
 
-    /// The byte offset a point `along` the line lands on. Shaped with the font the field is drawn
-    /// with, so the answer matches the pixels the user is pointing at.
-    pub fn index_for_x(&self, field: Field, along: f32, window: &Window) -> usize {
-        let Some(edit) = self.field(field) else {
-            return 0;
-        };
-        let font = self.ui_font(window);
-        let Some(line) = text_field::shape(edit.text(), text_field::size(field), window, &font)
-        else {
-            return edit.len();
-        };
-        line.closest_index_for_x(px(along))
-    }
-
-    fn shape_field(&self, field: Field, window: &Window) -> Option<gpui::ShapedLine> {
-        let font = self.ui_font(window);
-        text_field::shape(
-            self.field(field)?.text(),
-            text_field::size(field),
-            window,
-            &font,
-        )
-    }
-
-    /// A field's contents changed. The font box mirrors a setting; the others exist purely to be
-    /// read when the user presses Enter, so repainting is all they need.
-    pub fn field_changed(&mut self, field: Field, cx: &mut Context<Self>) {
-        match field {
-            Field::Font => self.font_text_changed(cx),
-            Field::UserAgent => self.ua_text_changed(cx),
-            Field::Proxy => self.proxy_text_changed(cx),
-            // The remaining boxes are only read when the user presses Enter, so a repaint is
-            // enough for them.
-            Field::FontSearch | Field::Add(_) => cx.notify(),
+    /// A box's Escape/Tab handler, bound to this app.
+    ///
+    /// `TextInput::on_dismiss` carries no event, so `Context::listener` cannot build it: the type
+    /// is `Fn(&mut Window, &mut App)` with nothing in it to say which view it belongs to. A weak
+    /// handle is the only thing that does.
+    pub(crate) fn dismissal(
+        cx: &Context<Self>,
+        run: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let weak = cx.weak_entity();
+        move |window, cx| {
+            weak.update(cx, |this, cx| run(this, window, cx)).ok();
         }
+    }
+
+    /// Whether any of the app's own boxes holds the caret.
+    ///
+    /// The root's single key handler needs this: a box answers Enter and Escape itself, and a
+    /// second answer from the root would run the same action twice — close a dialog, then close
+    /// whatever was underneath it.
+    pub fn field_focused(&self, window: &Window, cx: &App) -> bool {
+        let holds = |field: &Entity<TextInput>| field.read(cx).focus_handle().is_focused(window);
+        holds(&self.input)
+            || holds(&self.font_input)
+            || holds(&self.font_search)
+            || holds(&self.ua_input)
+            || holds(&self.proxy_input)
+            || self.add_dialog.as_ref().is_some_and(|dialog| {
+                AddField::ALL
+                    .into_iter()
+                    .any(|which| holds(dialog.input(which)))
+            })
     }
 
     /// Show or hide the font picker. Whatever the panel does with focus, it hands it back to the
@@ -1578,10 +1555,10 @@ impl NexusApp {
     pub fn toggle_font_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.font_menu_open = !self.font_menu_open;
         if self.font_menu_open {
-            self.font_query.clear();
-            window.focus(&self.search_focus, cx);
+            self.font_search.update(cx, |field, cx| field.clear(cx));
+            self.focus_field(&self.font_search, window, cx);
         } else {
-            window.focus(&self.font_focus, cx);
+            self.focus_field(&self.font_input, window, cx);
         }
         cx.notify();
     }
@@ -1589,9 +1566,15 @@ impl NexusApp {
     pub fn close_font_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.font_menu_open {
             self.font_menu_open = false;
-            window.focus(&self.font_focus, cx);
+            self.focus_field(&self.font_input, window, cx);
             cx.notify();
         }
+    }
+
+    /// Hand the keyboard to one of the app's boxes.
+    fn focus_field(&self, field: &Entity<TextInput>, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = field.read(cx).focus_handle().clone();
+        window.focus(&handle, cx);
     }
 
     /// Append a family to the font list. Quoted when it has spaces, exactly as the box's own
@@ -1602,20 +1585,23 @@ impl NexusApp {
         } else {
             family.to_string()
         };
-        let current = self.font_draft.text().to_string();
+        let current = self.font_input.read(cx).text().to_string();
         let mut names: Vec<String> = crate::settings::font_stack(&current);
         if names.iter().any(|name| name == family) {
             return;
         }
         names.push(entry);
         let joined = names.join(", ");
-        self.font_draft.set(joined);
-        self.font_text_changed(cx);
+        // Writing the box does not report a change — `set_text` is the app talking to the widget,
+        // not the user talking to the app — so the sheet is told here.
+        self.font_input
+            .update(cx, |field, cx| field.set_text(joined.clone(), cx));
+        self.font_text_changed(&joined, cx);
     }
 
     /// The installed families matching the picker's filter, in display order.
-    pub fn font_matches(&self) -> Vec<&str> {
-        let query = self.font_query.text().trim().to_lowercase();
+    pub fn font_matches(&self, cx: &App) -> Vec<&str> {
+        let query = self.font_search.read(cx).text().trim().to_lowercase();
         self.fonts
             .iter()
             .filter(|family| query.is_empty() || family.to_lowercase().contains(&query))
@@ -1928,170 +1914,6 @@ fn open_folder(dir: &Path) {
     #[cfg(not(windows))]
     {
         let _ = Command::new("xdg-open").arg(dir).spawn();
-    }
-}
-
-/// The platform's view of the focused field.
-///
-/// This is not optional decoration: on Windows the IME delivers both its composition and its
-/// committed characters **only** through the input handler, and `WM_CHAR` is routed there too. A
-/// windowed app with no `EntityInputHandler` therefore types nothing at all in Chinese (and only
-/// gets ASCII through the `key_char` fallback on `WM_KEYDOWN`).
-impl EntityInputHandler for NexusApp {
-    fn text_for_range(
-        &mut self,
-        range: Range<usize>,
-        adjusted: &mut Option<Range<usize>>,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let edit = self.field(self.active_field(window)?)?;
-        let bytes = edit.utf16_to_bytes(range);
-        adjusted.replace(
-            byte_to_utf16(edit.text(), bytes.start)..byte_to_utf16(edit.text(), bytes.end),
-        );
-        edit.text().get(bytes).map(str::to_string)
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let edit = self.field(self.active_field(window)?)?;
-        let (range, reversed) = edit.utf16_range();
-        Some(UTF16Selection { range, reversed })
-    }
-
-    fn marked_text_range(
-        &self,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        let edit = self.field(self.active_field(window)?)?;
-        let marked = edit.marked()?;
-        Some(byte_to_utf16(edit.text(), marked.start)..byte_to_utf16(edit.text(), marked.end))
-    }
-
-    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(field) = self.active_field(window) else {
-            return;
-        };
-        if let Some(edit) = self.field_mut(field) {
-            edit.unmark();
-        }
-        cx.notify();
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(field) = self.active_field(window) else {
-            return;
-        };
-        let range = match self.field(field) {
-            Some(edit) => range.map(|range| edit.utf16_to_bytes(range)),
-            None => return,
-        };
-        if let Some(edit) = self.field_mut(field) {
-            edit.insert_at(range, &one_line(text));
-        }
-        self.field_changed(field, cx);
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range: Option<Range<usize>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(field) = self.active_field(window) else {
-            return;
-        };
-        let range = match self.field(field) {
-            Some(edit) => range.map(|range| edit.utf16_to_bytes(range)),
-            None => return,
-        };
-        let caret = new_selected_range.map(|range| utf16_to_byte(new_text, range.start));
-        if let Some(edit) = self.field_mut(field) {
-            edit.insert_marked_at(range, &one_line(new_text), caret);
-        }
-        self.field_changed(field, cx);
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        let field = self.active_field(window)?;
-        let line = self.shape_field(field, window)?;
-        // The scroll offset is recomputed from the element's real width instead of read back from
-        // the frame: `render` can only estimate the width, and a few pixels of disagreement moves
-        // nothing but the IME's candidate window.
-        let edit = self.field(field)?;
-        let bytes = edit.utf16_to_bytes(range_utf16);
-        let available = element_bounds.size.width.as_f32().max(0.0);
-        let font = self.ui_font(window);
-        let shift = text_field::caret_shift(
-            edit.text(),
-            edit.cursor(),
-            text_field::size(field),
-            window,
-            &font,
-            available,
-        );
-        Some(text_field::range_bounds(
-            &line,
-            bytes,
-            element_bounds,
-            shift,
-            window.line_height(),
-        ))
-    }
-
-    /// Not called by the Windows backend, which positions its candidate window from
-    /// `bounds_for_range` alone. `None` is the honest answer rather than a wrong offset.
-    fn character_index_for_point(
-        &mut self,
-        _point: gpui::Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        None
-    }
-
-    /// The IME moves the caret through this one.
-    fn set_selected_text_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(field) = self.active_field(window) else {
-            return;
-        };
-        let bytes = match self.field(field) {
-            Some(edit) => edit.utf16_to_bytes(range_utf16),
-            None => return,
-        };
-        if let Some(edit) = self.field_mut(field) {
-            edit.set_cursor(bytes.start, false);
-        }
-        cx.notify();
-    }
-
-    fn text_length_utf16(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
-        Some(self.field(self.active_field(window)?)?.utf16_len())
     }
 }
 

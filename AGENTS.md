@@ -68,21 +68,16 @@ src/
   store.rs      SQLite：schema、历史、事件日志、设置读写
   settings.rs   持久化偏好：主题/语言/字体/下载目录
   i18n.rs       全部界面文案，每种语言一个 struct
-  theme.rs      深浅两套调色板，作为 GPUI Global
   assets.rs     include_bytes! 嵌入图标
-  text_edit.rs  单行可编辑缓冲：光标/选区/IME/UTF-16 转换（纯逻辑，有测试）
   ui/
-    mod.rs        通用控件：IconButton / TextButton / segmented / Chip / ProgressBar /
-                  StatusBadge / icon() / hint / setting_row / settings_group /
-                  settings_divider / path_row，以及**唯一的模态骨架 `Modal`**
-                  （`MODAL_*` 尺寸常量、`modal_width` / `modal_body_max` / `scroll_fade`）
-    text_field.rs 全 app 唯一的输入框构造器 field() / card() / control_box()（见 GPUI-CE 坑 #8）
+    mod.rs        Nexus 自己的控件（库里没有的那些）：IconButton / Chip / ProgressBar /
+                  StatusBadge / icon() / CONNECTIONS / speed_options
     root.rs       根视图：标题栏、命令栏、筛选行、列表、新建下载弹窗、确认弹窗
     settings.rs   设置卡片（模态浮层，不占整页；主页永远只显示下载内容）
     task_row.rs   单个下载行
 assets/icons/   单色 SVG（GPUI 会当 alpha mask 上色，见下）
 resources/      放你自己的 aria2c.exe
-STYLE.md        统一视觉规范：颜色 / 字号 / 圆角 / 间距 / 控件目录
+STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同名文件里）
 ```
 
 ## 必须遵守的不变量
@@ -115,22 +110,23 @@ STYLE.md        统一视觉规范：颜色 / 字号 / 圆角 / 间距 / 控件�
 9. **数据库必须能优雅降级。** `Store` 的 `conn` 是 `Option`：打不开时 app 照常跑，
    只是不记录，并在设置页显示原因。不要在 `open` 失败时 panic 或让窗口打不开。
 
-10. **弹出的卡片只有一种骨架：`ui::Modal`。**
-    设置、新建下载、确认删除全都是 `Modal::new(id, 标题).block(..).action(..).build(theme, window)`。
-    遮罩、卡片宽度（`ui::modal_width`）、圆角、内边距、底色（`theme.surface`）、标题、
+10. **弹出的卡片只有一种骨架：`nexus_look::Modal`。**
+    设置、新建下载、确认删除全都是 `Modal::new(id, 标题).block(..).action(..)` —— 它自己就是
+    元素（`#[derive(IntoElement)]`），直接 `.child(..)` 挂上去，**没有 `.build(theme, window)`**。
+    遮罩、卡片宽度（`nexus_look::modal_width`）、圆角、内边距、底色（`theme.surface`）、标题、
     可滚动主体与渐隐、底部分隔线和按钮行——全部由它决定。
     **视图里不得再出现 `.occlude()` / `.rounded(px(16.0))` / `.bg(theme.scrim)` / `stop_propagation()`
     / `justify_end()` 这类手写的卡片外壳。** 需要新的差异时，给 `Modal` 加参数
-    （如 `.narrow(410.0)`、`.scrolling()`），不要另写一份。
+    （如 `.narrow(nexus_look::layout::MODAL_W_NARROW)`、`.scrolling()`），不要另写一份。
     每张卡片必须至少有一个退出的 `.action(..)` 按钮；不要加关闭叉、不要点遮罩关闭
     （理由见 `STYLE.md` 第 6 节）。
 
-11. **同一个控件只有一处定义。** 想写第二遍之前，先在 `ui/mod.rs` / `ui/text_field.rs`
-    里找——找不到就把第一遍提上去，再两处都用它。已经共享的：
-    `Modal`（卡片骨架）、`setting_row` + `text_field::control_box`（弹层里的每一行，
-    设置和新建下载共用）、`IconButton` / `TextButton` / `segmented` / `Chip` /
-    `StatusBadge` / `ProgressBar` / `setting_row` / `settings_group` / `settings_divider` /
-    `path_row` / `hint` / `open_folder`（`error_note` 已并进 `hint`）。
+11. **同一个控件只有一处定义。** 想写第二遍之前先去库里找：`nexus_look` 有 `Modal` /
+    `Row` / `SettingGroup` / `Segmented` / `Button` / `IconButton` / `TextInput` / `TitleBar` /
+    `Toast` / `hint` / `divider` / `card`；没有的（`IconButton` 的旧版 / `Chip` / `ProgressBar` /
+    `StatusBadge` / `icon()` / `CONNECTIONS` / `speed_options`）才在 `ui/mod.rs` —— 那些是
+    任务行专用的形状，不是可以再抄一份的理由。**弹窗里的一律用库的**：
+    `Modal`（卡片骨架）+ `Row`（弹层里的每一行，设置和新建下载共用）+ `SettingGroup`（组头）。
     判据很简单：同一段布局代码出现第二遍就是 bug，不论两处当下多像。
 
 12. **能从 `tasks` 算出来的东西不要存成字段。** 存下来的派生值只会在它自己的更新时机上刷新，
@@ -181,10 +177,16 @@ STYLE.md        统一视觉规范：颜色 / 字号 / 圆角 / 间距 / 控件�
    只需要按 `window.is_maximized()` 换图标。
    另外 `Drag` 区域必须是窗口按钮的**兄弟节点**，不能是祖先（否则按钮收不到点击）。
 
-8. 没有内置文本输入框 —— `ui/text_field.rs::field()` 是全 app 唯一的输入框构造器：`id` +
-   `track_focus` + chrome + 光标/选区/placeholder + 点击定位 + `handle_input` 全在里面，调用方
-   漏不了项（漏 `track_focus` 会静默丢键，见 `gs-issue.md` #5）；底层缓冲是
-   `text_edit.rs::TextEdit`，UTF-16 桥也收在那里。
+8. 没有内置文本输入框 —— **全 app 的输入框都是 `nexus_look::TextInput`**，库里的唯一实现：
+   `id` + `track_focus` + chrome + 光标/选区/placeholder + 点击定位 + `handle_input` 全在里面，
+   调用方漏不了项（漏 `track_focus` 会静默丢键，见 `gs-issue.md` #5）；底层缓冲和 UTF-16 桥
+   收在库的 `text_edit::TextEdit`。Nexus 自己不拼输入框，也**不持有 `TextEdit` / 裸
+   `FocusHandle`**（老的 `ui/text_field.rs` 已删）。
+   - Enter / Escape 接 `.on_submit(..)` / `.on_dismiss(..)`：`on_submit` 拿得到文本，
+     所以 `cx.listener` 就能造；**`on_dismiss` 的签名是 `Fn(&mut Window, &mut App)`，
+     没有事件参数，`cx.listener` 造不出来** —— 用 `NexusApp::dismissal(cx, |this, window, cx| ..)`。
+   - 根视图的 `handle_keys` 只在 `NexusApp::field_focused(window, cx)` 为假时才处理按键；
+     否则同一个 Enter 会把同一个动作跑两遍。
 
 **发现新的 GPUI-CE 或 skill 问题时，追加到 `gs-issue.md`**（带源码行号 + 最小复现）。
 用户会定期把它交给 skill 作者，所以要写成「对方能直接照改」的形式。

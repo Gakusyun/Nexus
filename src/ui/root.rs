@@ -1,27 +1,24 @@
-//! The root view: title bar, command bar, filter row, and the task list.
+//! The root view: title bar, command bar, filter row, the task list, and the three cards that
+//! float over it — confirmation, settings and new download.
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, ClickEvent, ColorExt, Context, FontWeight, IntoElement, KeyDownEvent, Render,
+    AnyElement, ClickEvent, ColorExt, Context, FontWeight, IntoElement, KeyDownEvent, Render,
     Window, div, px,
 };
 
 use super::settings::settings_dialog;
-use super::text_field::{self, Outcome, apply_key};
-use nexus_look::IconButton as LookIconButton;
-use super::{
-    CONNECTIONS, CONTROL, CONTROL_GAP, Chip, Modal, TextButton, Variant, hint, icon,
-    segmented, setting_row, speed_options,
-};
+use super::{CONNECTIONS, Chip, icon, speed_options};
 use crate::i18n::Strings;
 use crate::model::fmt_speed;
-use crate::state::{AddField, Engine, Field, Filter, NexusApp};
-use nexus_look::Theme;
+use crate::state::{AddField, Engine, Filter, NexusApp};
+use nexus_look::IconButton as LookIconButton;
+use nexus_look::{Button, Choice, Modal, Row, Segmented, Theme, Tone, hint, space, text};
 
 /// The page's horizontal gutter. Taken from the language rather than chosen here, so a screenshot
 /// of Nexus and a screenshot of any other Nexus-look app line up as they should.
 pub const PAGE_PADDING: f32 = nexus_look::space::XL;
-const GAP_BUTTON: f32 = 12.0;
+const GAP_BUTTON: f32 = nexus_look::space::MD;
 
 impl Render for NexusApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -37,32 +34,27 @@ impl Render for NexusApp {
             .bg(theme.bg)
             .text_color(theme.text)
             .font(self.ui_font(window))
-            // One keyboard handler for the whole view. Every field is a descendant, so their keys
-            // bubble here, and `active_field` says which buffer they belong to — far safer than
-            // hoping each box's own node ends up on the focus dispatch path.
+            // One keyboard handler for the whole view. Every box is a descendant, so its keys
+            // bubble here — but a box that has focus has already answered Enter and Escape
+            // itself, and what is left for the root is the layers with no box to ask: the two
+            // dialogs and the card behind them.
             .on_key_down(cx.listener(handle_keys))
-            .child(title_bar(strings, self.settings_open, window, cx))
-            .child(self.body(strings, &theme, window, cx))
+            .child(title_bar(strings, self.settings_open, cx))
+            .child(self.body(strings, &theme, cx))
             .when_some(self.confirm.as_ref(), |element, confirm| {
-                element.child(confirm_dialog(confirm, strings, &theme, window, cx))
+                element.child(confirm_dialog(confirm, strings, cx))
             })
             .when(self.settings_open, |element| {
-                element.child(settings_dialog(self, strings, &theme, window, cx))
+                element.child(settings_dialog(self, strings, window, cx))
             })
             .when(self.add_dialog.is_some(), |element| {
-                element.child(add_dialog(self, strings, &theme, window, cx))
+                element.child(add_dialog(self, strings, window, cx))
             })
     }
 }
 
 impl NexusApp {
-    fn body(
-        &self,
-        strings: &'static Strings,
-        theme: &Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn body(&self, strings: &'static Strings, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let visible = self.visible();
         let empty = visible.is_empty();
 
@@ -101,7 +93,7 @@ impl NexusApp {
             // to the *content* only. A strip inset by the page gutter is not a toolbar and not a
             // card — it is a white rectangle floating in the middle of the page, which is exactly
             // how it read.
-            .child(command_bar(self, strings, theme, window, cx))
+            .child(command_bar(self, strings, theme, cx))
             .child(
                 div()
                     .relative()
@@ -121,7 +113,7 @@ impl NexusApp {
                     // last so it paints above the rows. There is at most one at a time; a second
                     // replaces the first (see `NexusApp::warn`).
                     .when_some(self.notice.clone(), |element, notice| {
-                        element.child(nexus_look::Toast::new("notice", notice).build(window, cx))
+                        element.child(nexus_look::Toast::new("notice", notice))
                     }),
             )
             .into_any_element()
@@ -136,9 +128,8 @@ impl NexusApp {
 fn title_bar(
     strings: &Strings,
     settings_open: bool,
-    window: &Window,
     cx: &mut Context<NexusApp>,
-) -> impl IntoElement + use<> {
+) -> nexus_look::TitleBar {
     nexus_look::TitleBar::new(strings.app_name)
         .logo("icons/logo.svg")
         .action(
@@ -146,7 +137,6 @@ fn title_bar(
                 .active(settings_open)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_settings(cx))),
         )
-        .build(window, cx)
 }
 
 // -------------------------------------------------------------------- command bar
@@ -155,7 +145,6 @@ fn command_bar(
     this: &NexusApp,
     strings: &'static Strings,
     theme: &Theme,
-    _window: &mut Window,
     cx: &mut Context<NexusApp>,
 ) -> impl IntoElement + use<> {
     let filled = !this.input.read(cx).text().trim().is_empty();
@@ -195,8 +184,9 @@ fn command_bar(
 
 // ------------------------------------------------------------------- keyboard input
 
-/// The view's single keyboard handler; `apply_key` owns everything about a field, and this only
-/// decides what Enter and Escape mean for the field that happens to hold the caret.
+/// The view's single keyboard handler. Every box owns its own editing keys — the library's input
+/// buffers, moves the caret and talks to the IME itself — so what is left for the root is what
+/// Enter and Escape *mean* when no box is talking: which layer is open, and which one closes.
 ///
 /// It lives on the root rather than on each box because a key event is dispatched along the path
 /// from the window root to whatever holds the focus: the root is on every one of those paths,
@@ -217,67 +207,30 @@ fn handle_keys(
         return;
     }
 
-    // The command bar owns its own editing keys — the library's input buffers, moves the caret and
-    // talks to the IME itself. What is left for the app is what Enter and Escape *mean* here, and
-    // only the app can know that.
-    if this.input.read(cx).focus_handle().is_focused(window) {
+    // A focused box has already answered Enter and Escape — on_submit and on_dismiss are wired to
+    // the rule of whatever layer it is in. Answering again here would run the same action twice.
+    if this.field_focused(window, cx) {
+        return;
+    }
+
+    // With the dialog open and nothing focused (it opens with the URL box focused, but a click on
+    // the card's padding blurs it), the dialog still answers the two keys that matter.
+    if this.add_dialog.is_some() {
         match key {
-            "enter" => this.submit(cx),
-            "escape" => {
-                this.notice = None;
-                cx.notify();
-            }
+            "escape" => this.close_add_dialog(window, cx),
+            "enter" => this.start_add_download(window, cx),
             _ => {}
         }
         return;
     }
 
-    // Clicking away blurs every box, so there may be no field at all. The dialogs still answer
-    // Escape, and the add dialog answers Enter, even with nothing focused.
-    let Some(field) = this.active_field(window) else {
-        if this.add_dialog.is_some() {
-            match key {
-                "escape" => this.close_add_dialog(window, cx),
-                "enter" => this.start_add_download(window, cx),
-                _ => {}
-            }
-        } else if key == "escape" {
-            // Escape backs out one layer at a time: the font picker, then the settings card.
-            if this.font_menu_open {
-                this.close_font_menu(window, cx);
-            } else if this.settings_open {
-                this.cancel_settings(window, cx);
-            }
+    if key == "escape" {
+        // Escape backs out one layer at a time: the font picker, then the settings card.
+        if this.font_menu_open {
+            this.close_font_menu(window, cx);
+        } else if this.settings_open {
+            this.cancel_settings(window, cx);
         }
-        return;
-    };
-
-    let Some(edit) = this.field_mut(field) else {
-        return;
-    };
-    let outcome = apply_key(edit, event, cx);
-    match outcome {
-        Outcome::Handled => this.field_changed(field, cx),
-        Outcome::Submit => {
-            if field == Field::Add(AddField::Uri) {
-                this.start_add_download(window, cx);
-            }
-        }
-        Outcome::Dismiss => {
-            // Escape closes the topmost layer in one step: the add dialog, then the font picker,
-            // then the settings card.
-            if this.add_dialog.is_some() {
-                this.close_add_dialog(window, cx);
-            } else if this.font_menu_open {
-                this.close_font_menu(window, cx);
-            } else if this.settings_open {
-                this.cancel_settings(window, cx);
-            } else {
-                window.blur();
-                cx.notify();
-            }
-        }
-        Outcome::Ignored => {}
     }
 }
 
@@ -322,8 +275,8 @@ fn filter_bar(
 
     if finished > 0 {
         right = right.child(
-            TextButton::new("clear-finished", strings.clear_finished, Variant::Ghost)
-                .leading("icons/trash.svg", 13.0)
+            Button::ghost("clear-finished", strings.clear_finished)
+                .icon("icons/trash.svg")
                 .on_click(
                     cx.listener(|this, _: &ClickEvent, _, cx| this.request_clear_finished(cx)),
                 ),
@@ -455,24 +408,22 @@ fn empty_state(theme: &Theme, filter: Filter, strings: &Strings) -> impl IntoEle
 fn confirm_dialog(
     confirm: &crate::state::Confirm,
     strings: &'static Strings,
-    theme: &Theme,
-    window: &Window,
     cx: &mut Context<NexusApp>,
-) -> impl IntoElement + use<> {
-    let (text, muted) = (theme.text, theme.text_muted);
+) -> Modal {
+    let theme = Theme::of(cx);
 
     // One line per fact. Joining them into a single line (what this used to do) meant a long name
     // pushed the path into a break wherever it happened to land — the path ended up split across
     // "C:\Users\Xuejun" and "\Downloads".
     let facts = confirm.facts.iter().fold(
-        div().flex().flex_col().flex_none().gap(px(3.0)),
+        div().flex().flex_col().flex_none().gap(px(space::XS)),
         |list, fact| {
             list.child(
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(11.5))
-                    .text_color(muted)
+                    .text_size(px(text::CAPTION))
+                    .text_color(theme.text_muted)
                     .child(fact.clone()),
             )
         },
@@ -486,14 +437,14 @@ fn confirm_dialog(
         .flex_row()
         .flex_none()
         .items_center()
-        .gap(px(12.0))
+        .gap(px(space::MD))
         .when(!confirm.subject.is_empty(), |row| {
             row.child(
                 div()
                     .flex_1()
                     .truncate()
-                    .text_size(px(12.5))
-                    .text_color(text)
+                    .text_size(px(text::BODY))
+                    .text_color(theme.text)
                     .child(confirm.subject.clone()),
             )
         })
@@ -501,117 +452,60 @@ fn confirm_dialog(
             row.child(
                 div()
                     .flex_none()
-                    .text_size(px(12.5))
-                    .text_color(text)
+                    .text_size(px(text::BODY))
+                    .text_color(theme.text)
                     .child(confirm.size.clone()),
             )
         });
     let has_header = !confirm.subject.is_empty() || !confirm.size.is_empty();
 
     Modal::new("confirm-card", confirm.heading.clone())
-        .narrow(CONFIRM_WIDTH)
+        .narrow(nexus_look::layout::MODAL_W_NARROW)
         .block(
             div()
                 .flex()
                 .flex_col()
                 .flex_none()
-                .gap(px(5.0))
+                .gap(px(space::SM))
                 .when(has_header, |element| element.child(header))
                 .child(facts),
         )
         .action(
-            TextButton::new("confirm-cancel", strings.cancel, Variant::Secondary)
+            Button::secondary("confirm-cancel", strings.cancel)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.dismiss_confirm(cx))),
         )
         .action(
-            TextButton::new("confirm-keep", strings.keep_file, Variant::Secondary).on_click(
+            Button::secondary("confirm-keep", strings.keep_file).on_click(
                 cx.listener(|this, _: &ClickEvent, _, cx| this.resolve_confirm(false, cx)),
             ),
         )
         .action(
-            TextButton::new("confirm-delete", strings.delete_file, Variant::Danger).on_click(
+            Button::danger("confirm-delete", strings.delete_file).on_click(
                 cx.listener(|this, _: &ClickEvent, _, cx| this.resolve_confirm(true, cx)),
             ),
         )
-        .build(theme, window)
 }
 
 // -------------------------------------------------------------- add-download dialog
 
-/// The confirmation box is the one card that is not a sheet: a single question and two or three
-/// buttons. At the sheet width it would be mostly empty space.
-const CONFIRM_WIDTH: f32 = 410.0;
-
-/// The "save to" row's sibling button. Fixed width, so the box beside it has an exact width to hand
-/// to the caret instead of an estimate.
-const CHOOSE_BUTTON: f32 = 96.0;
-/// What the box beside that button gets.
-const DIR_BOX: f32 = CONTROL - CHOOSE_BUTTON - CONTROL_GAP;
-
-/// One row of the new-download dialog: a label, and a box in the control column.
-///
-/// This is [`setting_row`] + [`text_field::control_box`] — the same two pieces the settings sheet is
-/// built from, so the dialog reads as the same table rather than as a stack of forms.
-#[allow(clippy::too_many_arguments)]
-fn add_row(
-    this: &NexusApp,
-    theme: &Theme,
-    window: &Window,
-    cx: &mut Context<NexusApp>,
-    label: &'static str,
-    note: &'static str,
-    id: &'static str,
-    field: AddField,
-    placeholder: &'static str,
-) -> impl IntoElement {
-    setting_row(
-        theme,
-        label,
-        note,
-        text_field::control_box(
-            this,
-            theme,
-            window,
-            cx,
-            id,
-            Field::Add(field),
-            placeholder,
-            CONTROL,
-        ),
-    )
-}
-
-/// A row of choices, e.g. the connection count or the speed limit.
-fn choice_row(
-    theme: &Theme,
-    label: &'static str,
-    note: &'static str,
-    id: &'static str,
-    options: Vec<(
-        &'static str,
-        bool,
-        impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    )>,
-) -> impl IntoElement {
-    setting_row(theme, label, note, segmented(theme, id, options))
-}
-
 /// The advanced new-download dialog. The quick bar stays the one-paste path; this is for the
 /// times a download needs its own name, folder, user agent, proxy or connection count.
+///
+/// Every row is the settings sheet's `Row`, so this card is the same table with different rows
+/// rather than a stack of forms: the two line up field for field, control column to control
+/// column, and neither can drift into its own idea of where a label ends.
 fn add_dialog(
     this: &NexusApp,
     strings: &'static Strings,
-    theme: &Theme,
     window: &Window,
     cx: &mut Context<NexusApp>,
-) -> impl IntoElement + use<> {
+) -> Modal {
     let dialog = this.add_dialog.as_ref().expect("rendered only when open");
-    let faint = theme.text_faint;
 
     let connections: Vec<_> = CONNECTIONS
         .iter()
         .map(|&(label, value)| {
-            (
+            Choice::new(
                 label,
                 dialog.connections == value,
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.set_add_connections(value, cx)),
@@ -621,7 +515,7 @@ fn add_dialog(
     let speed: Vec<_> = speed_options(strings)
         .iter()
         .map(|&(label, value)| {
-            (
+            Choice::new(
                 label,
                 dialog.speed_limit == value,
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.set_add_speed_limit(value, cx)),
@@ -629,125 +523,42 @@ fn add_dialog(
         })
         .collect();
 
+    let box_of = |which| dialog.input(which).clone();
+
     Modal::new("add-card", strings.add_title)
         .scrolling()
-        .block(add_row(
-            this,
-            theme,
-            window,
-            cx,
-            strings.download_link,
-            "",
-            "add-uri",
-            AddField::Uri,
-            strings.placeholder,
-        ))
-        .block(save_row(this, strings, theme, window, cx))
-        .block(add_row(
-            this,
-            theme,
-            window,
-            cx,
-            strings.file_name,
-            "",
-            "add-name",
-            AddField::Name,
-            strings.file_name_placeholder,
-        ))
-        .block(add_row(
-            this,
-            theme,
-            window,
-            cx,
-            strings.user_agent,
-            strings.user_agent_note,
-            "add-ua",
-            AddField::UserAgent,
-            strings.user_agent_placeholder,
-        ))
-        .block(choice_row(
-            theme,
-            strings.connections,
-            strings.connections_note,
-            "add-connections",
-            connections,
-        ))
-        .block(add_row(
-            this,
-            theme,
-            window,
-            cx,
-            strings.proxy,
-            "",
-            "add-proxy",
-            AddField::Proxy,
-            strings.proxy_placeholder,
-        ))
-        .block(add_row(
-            this,
-            theme,
-            window,
-            cx,
-            strings.referer,
-            "",
-            "add-referer",
-            AddField::Referer,
-            strings.referer_placeholder,
-        ))
-        .block(choice_row(
-            theme,
-            strings.per_download_speed_limit,
-            "",
-            "add-speed",
-            speed,
-        ))
-        .block(hint(strings.per_download_note, faint))
-        .action(
-            TextButton::new("add-cancel", strings.cancel, Variant::Secondary).on_click(
-                cx.listener(|this, _: &ClickEvent, window, cx| this.close_add_dialog(window, cx)),
-            ),
+        .block(Row::new(strings.download_link, "").control(box_of(AddField::Uri)))
+        .block(
+            Row::new(strings.save_to, "")
+                .control(box_of(AddField::Dir))
+                .action(
+                    Button::secondary("add-choose-dir", strings.choose).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.choose_add_dir(cx)),
+                    ),
+                ),
         )
+        .block(Row::new(strings.file_name, "").control(box_of(AddField::Name)))
+        .block(
+            Row::new(strings.user_agent, strings.user_agent_note)
+                .control(box_of(AddField::UserAgent)),
+        )
+        .block(
+            Row::new(strings.connections, strings.connections_note)
+                .control(Segmented::new("add-connections").choices(connections)),
+        )
+        .block(Row::new(strings.proxy, "").control(box_of(AddField::Proxy)))
+        .block(Row::new(strings.referer, "").control(box_of(AddField::Referer)))
+        .block(
+            Row::new(strings.per_download_speed_limit, "")
+                .control(Segmented::new("add-speed").choices(speed)),
+        )
+        .block(hint(strings.per_download_note, Tone::Neutral, window, cx))
+        .action(Button::secondary("add-cancel", strings.cancel).on_click(
+            cx.listener(|this, _: &ClickEvent, window, cx| this.close_add_dialog(window, cx)),
+        ))
         .action(
-            TextButton::new("add-start", strings.start_download, Variant::Primary).on_click(
+            Button::primary("add-start", strings.start_download).on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| this.start_add_download(window, cx)),
             ),
         )
-        .build(theme, window)
-}
-
-/// The "save to" row: the folder box, and the button that opens the folder picker on the same line.
-fn save_row(
-    this: &NexusApp,
-    strings: &'static Strings,
-    theme: &Theme,
-    window: &Window,
-    cx: &mut Context<NexusApp>,
-) -> impl IntoElement {
-    setting_row(
-        theme,
-        strings.save_to,
-        "",
-        div()
-            .flex()
-            .flex_row()
-            .flex_none()
-            .w(px(CONTROL))
-            .items_center()
-            .gap(px(CONTROL_GAP))
-            .child(text_field::control_box(
-                this,
-                theme,
-                window,
-                cx,
-                "add-dir",
-                Field::Add(AddField::Dir),
-                strings.dir_placeholder,
-                DIR_BOX,
-            ))
-            .child(
-                TextButton::new("add-choose-dir", strings.choose, Variant::Secondary)
-                    .width(CHOOSE_BUTTON)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.choose_add_dir(cx))),
-            ),
-    )
 }
