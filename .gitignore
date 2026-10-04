@@ -1,0 +1,13 @@
+target/
+gs-issue.md
+app-screenshot/
+resources/
+# Runtime state: the app keeps its database and log in the directory it was started from.
+# `cargo run` therefore drops them in the project root.
+nexus.db
+nexus.db-wal
+nexus.db-shm
+nexus.log
+state.json
+state.json.imported
+downloads/

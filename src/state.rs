@@ -1,0 +1,2155 @@
+//! Application state: the task list, the filter, the engine connection, and the polling
+//! loop that keeps all of it in sync with aria2.
+//!
+//! This entity is the root view. Every mutation goes through a method here so that
+//! persistence and `cx.notify()` stay in one place.
+
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use gpui::{
+    AppContext, Bounds, Context, EntityInputHandler, FocusHandle, Font, FontFallbacks,
+    PathPromptOptions, Pixels, Subscription, UTF16Selection, Window, WindowAppearance, px,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::aria2::{Aria2, DownloadRequest, EngineOptions, Snapshot};
+use crate::i18n::{self, Strings};
+use crate::model::{Status, Task, fmt_size, total_speed};
+use crate::settings::{Language, Settings, ThemeMode, font_stack};
+use crate::store::{Event, Store};
+use crate::text_edit::{TextEdit, byte_to_utf16, one_line, utf16_to_byte};
+use crate::theme::Theme;
+use crate::ui::text_field;
+
+/// How often we ask aria2 for fresh numbers.
+const POLL: Duration = Duration::from_millis(500);
+/// A hiccup must repeat this many times before the UI admits the engine is gone.
+const FAILURE_TOLERANCE: u32 = 5;
+/// How often progress *numbers* are written to the database. Status changes are written the
+/// moment they happen; the byte counters move twice a second while downloading, and there is
+/// no reason to make the disk watch that.
+const PROGRESS_FLUSH: Duration = Duration::from_secs(3);
+/// The SQLite file, next to the app's other data.
+const DATABASE: &str = "nexus.db";
+
+/// How hard [`discard_download`] tries before it gives up. The budget has to outlast two things:
+/// Windows closing the handle after aria2 is told to forget a live download, and the antivirus
+/// scan that follows a freshly written large file — Defender holding a 1.5 GB image is the usual
+/// reason a delete looks like it did nothing. A file that is really locked stays locked, so the
+/// wait is bounded and the failure is reported.
+const DELETE_TRIES: u32 = 6;
+const DELETE_RETRY: Duration = Duration::from_millis(250);
+
+/// Which editable field a keystroke, a click or an input-method event belongs to.
+///
+/// The platform only ever knows "the view", so the three single-line fields this app owns have to
+/// be told apart by whoever handles the event — the focused field's `FocusHandle` is the only
+/// thing that says which one that is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Field {
+    /// The URL bar.
+    Link,
+    /// The font family list.
+    Font,
+    /// The font picker's filter.
+    FontSearch,
+    /// The engine's user agent.
+    UserAgent,
+    /// The engine's proxy.
+    Proxy,
+    /// A box in the add-download dialog.
+    Add(AddField),
+}
+
+/// The editable boxes the add-download dialog owns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AddField {
+    Uri,
+    Dir,
+    Name,
+    UserAgent,
+    Proxy,
+    Referer,
+}
+
+impl AddField {
+    pub const ALL: [AddField; 6] = [
+        AddField::Uri,
+        AddField::Dir,
+        AddField::Name,
+        AddField::UserAgent,
+        AddField::Proxy,
+        AddField::Referer,
+    ];
+}
+
+/// The open add-download dialog.
+///
+/// It owns the per-download choices for one task. The buffers are indexed by [`AddField`], so a
+/// field is added by extending the enum and the array, not by another struct field and focus
+/// handle. The whole dialog is dropped when it closes.
+pub struct AddDialog {
+    edits: [TextEdit; 6],
+    focuses: [FocusHandle; 6],
+    pub connections: u32,
+    /// This download's `max-download-limit`; `0` is unlimited.
+    pub speed_limit: u64,
+}
+
+impl AddDialog {
+    fn new(cx: &mut Context<NexusApp>) -> Self {
+        Self {
+            edits: std::array::from_fn(|_| TextEdit::default()),
+            focuses: std::array::from_fn(|_| cx.focus_handle()),
+            connections: 0,
+            speed_limit: 0,
+        }
+    }
+
+    pub fn edit(&self, which: AddField) -> &TextEdit {
+        &self.edits[which as usize]
+    }
+
+    pub fn focus(&self, which: AddField) -> &FocusHandle {
+        &self.focuses[which as usize]
+    }
+
+    pub fn text(&self, which: AddField) -> &str {
+        self.edit(which).text()
+    }
+
+    fn set(&mut self, which: AddField, text: impl Into<String>) {
+        self.edits[which as usize].set(text);
+    }
+
+    /// Which box currently holds the caret, if any.
+    fn focused(&self, window: &Window) -> Option<AddField> {
+        AddField::ALL
+            .into_iter()
+            .find(|which| self.focus(*which).is_focused(window))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Filter {
+    All,
+    Downloading,
+    Completed,
+}
+
+impl Filter {
+    pub const ALL: [Filter; 3] = [Filter::All, Filter::Downloading, Filter::Completed];
+
+    pub fn label(self, strings: &Strings) -> &'static str {
+        match self {
+            Filter::All => strings.filter_all,
+            Filter::Downloading => strings.filter_active,
+            Filter::Completed => strings.filter_finished,
+        }
+    }
+
+    fn matches(self, status: Status) -> bool {
+        match self {
+            Filter::All => true,
+            // "Active" means work actually in flight. A paused download is not active — it
+            // would otherwise be counted here while its own badge reads "Paused".
+            // Paused and failed rows stay reachable under "All".
+            Filter::Downloading => matches!(status, Status::Active | Status::Waiting),
+            // Terminal states, so this count matches exactly what "Clear finished" removes.
+            Filter::Completed => status.is_terminal(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Connecting,
+    Online,
+    Failed(String),
+}
+
+/// A destructive action parked until the user says what should happen to the bytes on disk.
+///
+/// The dialog only exists when there is actually something to delete, so "remove a task whose
+/// file was never created" stays a single click.
+pub struct Confirm {
+    pub heading: String,
+    /// What will be removed, on a line of its own. Keeping it separate is what stops a long name
+    /// from shoving the path into an arbitrary break — the reason this used to be one joined line.
+    pub subject: String,
+    /// How many bytes are at stake, spelled out. Sits across from `subject` rather than in the
+    /// list below: it is the other half of the delete/keep decision, and as one more left-aligned
+    /// line it read as just another detail.
+    pub size: String,
+    /// The facts under it — location, file count — one line each so each gets the whole card.
+    pub facts: Vec<String>,
+    /// Rows to drop once the user decides.
+    seqs: Vec<u64>,
+}
+
+pub struct NexusApp {
+    pub tasks: Vec<Task>,
+    pub engine: Engine,
+    pub filter: Filter,
+    pub download_dir: PathBuf,
+    /// The command bar's URL field.
+    pub input: TextEdit,
+    pub focus: FocusHandle,
+    pub caret_on: bool,
+    pub notice: Option<String>,
+    /// Mirrors the platform window state, refreshed by `observe_window_bounds`, so the
+    /// title bar can swap maximise for restore.
+    pub maximized: bool,
+    /// Whether the settings page is showing.
+    pub settings_open: bool,
+    /// Set while a removal is waiting to be confirmed.
+    pub confirm: Option<Confirm>,
+    /// Set while the add-download dialog is open.
+    pub add_dialog: Option<AddDialog>,
+    pub settings: Settings,
+    /// What the settings sheet is editing. `Some` only while it is open: the widgets read and
+    /// write this copy, so nothing reaches disk until Save and Cancel just drops it. See
+    /// [`NexusApp::active_settings`].
+    draft: Option<Settings>,
+    /// What is typed in the font box, exactly as typed. Kept apart from `settings.font` so
+    /// the trimming that goes into the database cannot move the caret while the user types.
+    pub font_draft: TextEdit,
+    pub font_focus: FocusHandle,
+    /// Whether the font picker's panel is showing.
+    pub font_menu_open: bool,
+    /// The picker's filter box.
+    pub font_query: TextEdit,
+    pub search_focus: FocusHandle,
+    /// What is typed in the engine's user-agent box, kept apart from `settings.user_agent` for
+    /// the same reason as `font_draft`: trimming must not move the caret while typing.
+    pub ua_draft: TextEdit,
+    pub ua_focus: FocusHandle,
+    /// Likewise for the proxy box.
+    pub proxy_draft: TextEdit,
+    pub proxy_focus: FocusHandle,
+    /// The field a selection drag is currently extending, if any.
+    pub dragging: Option<Field>,
+    /// The font list, read from the platform once because the settings page needs it on
+    /// every frame while it is open.
+    pub fonts: Vec<String>,
+    /// The history database. Always present; it may be disabled if it could not be opened.
+    pub store: Store,
+    /// Last state written to the database, per task, so a flush only touches rows that
+    /// actually moved and the event log only records real transitions.
+    seen: HashMap<u64, (Status, u64)>,
+    last_flush: Instant,
+    aria2: Option<Arc<Aria2>>,
+    /// Set when the persisted state no longer matches memory.
+    dirty: bool,
+    seq: u64,
+    failures: u32,
+    /// Kept alive so the bounds callback stays registered for the view's lifetime.
+    _bounds: Option<Subscription>,
+    /// Likewise for the light/dark callback.
+    _appearance: Option<Subscription>,
+}
+
+impl NexusApp {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let store = Store::open(data_dir().join(DATABASE));
+
+        // Preferences are one row per key. A database written before that change keeps them
+        // in a single JSON blob; fold it in once.
+        Settings::absorb_legacy(&store);
+
+        // On the very first run after the switch to SQLite the old `state.json` is imported
+        // once, then renamed so it cannot be imported twice. It only wins while the database
+        // holds no preferences of its own.
+        let legacy = (!store.has_settings()).then(Persisted::load);
+        let settings = match &legacy {
+            Some(saved) => saved.settings.clone(),
+            None => Settings::load(&store),
+        };
+        let download_dir = settings
+            .download_dir
+            .as_ref()
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                legacy
+                    .as_ref()
+                    .and_then(|saved| saved.download_dir.clone())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(default_download_dir);
+        // Keep the settings row authoritative: the folder used to live in a sibling field of
+        // the old JSON file, and a migrated row would otherwise read back as "not set" and
+        // silently fall back to the default on the next launch.
+        let mut settings = settings;
+        settings.download_dir = Some(download_dir.to_string_lossy().into_owned());
+
+        // Anything still "in flight" when the app last closed is really just a leftover
+        // record: aria2 restarts with the app, so those gids are gone. Showing the rows
+        // as paused — rather than pretending they are running — is honest, and pressing
+        // resume re-attaches them through aria2's own resume support.
+        let stored = match &legacy {
+            Some(saved) => saved.tasks.clone(),
+            None => store.load_downloads(),
+        };
+        let tasks: Vec<Task> = stored
+            .into_iter()
+            .map(|mut task| {
+                task.status = if task.status.is_terminal() {
+                    task.status
+                } else {
+                    Status::Paused
+                };
+                task.speed = 0;
+                task
+            })
+            .collect();
+
+        // Hidden rows still own their number, so the list cannot be the only source for this.
+        let seq = tasks
+            .iter()
+            .map(|task| task.seq)
+            .max()
+            .unwrap_or(0)
+            .max(store.highest_seq())
+            + 1;
+        let focus = cx.focus_handle();
+        let font_focus = cx.focus_handle();
+        let search_focus = cx.focus_handle();
+        let mut font_draft = TextEdit::default();
+        font_draft.set(settings.font.clone().unwrap_or_default());
+        let font_query = TextEdit::default();
+        let ua_focus = cx.focus_handle();
+        let proxy_focus = cx.focus_handle();
+        let mut ua_draft = TextEdit::default();
+        ua_draft.set(settings.user_agent.clone().unwrap_or_default());
+        let mut proxy_draft = TextEdit::default();
+        proxy_draft.set(settings.proxy.clone().unwrap_or_default());
+        let maximized = window.is_maximized();
+        // Sorted once: the picker lists them in a stable order and nothing here cares about the
+        // platform's.
+        let mut fonts = cx.text_system().all_font_names();
+        fonts.sort_by_key(|family| family.to_lowercase());
+        // Apply the stored palette before the first frame paints.
+        cx.set_global(Theme::for_mode(
+            settings.theme.is_dark(is_dark(window.appearance())),
+        ));
+
+        // Remember what the database already knows, so the first flush neither rewrites
+        // unchanged rows nor logs events for downloads that were recorded last session.
+        let seen = tasks
+            .iter()
+            .map(|task| (task.seq, (task.status, task.completed)))
+            .collect();
+
+        let mut app = Self {
+            tasks,
+            engine: Engine::Connecting,
+            filter: Filter::All,
+            download_dir,
+            input: TextEdit::default(),
+            focus,
+            caret_on: true,
+            notice: None,
+            maximized,
+            settings_open: false,
+            confirm: None,
+            add_dialog: None,
+            settings,
+            draft: None,
+            font_draft,
+            font_focus,
+            font_menu_open: false,
+            font_query,
+            search_focus,
+            ua_draft,
+            ua_focus,
+            proxy_draft,
+            proxy_focus,
+            dragging: None,
+            fonts,
+            store,
+            seen,
+            last_flush: Instant::now(),
+            aria2: None,
+            dirty: false,
+            seq,
+            failures: 0,
+            _bounds: None,
+            _appearance: None,
+        };
+
+        if legacy.is_some() {
+            app.import_legacy();
+        } else {
+            // Keep the stored rows in step with what we just resolved, so a value derived
+            // rather than read (the download folder, once) is written down instead of being
+            // re-derived every launch.
+            app.save_settings();
+        }
+
+        // Maximising changes the window bounds and nothing else we care about, so without
+        // this the restore glyph would only appear on the next unrelated repaint.
+        app._bounds = Some(cx.observe_window_bounds(window, |this, window, cx| {
+            let maximized = window.is_maximized();
+            if this.maximized != maximized {
+                this.maximized = maximized;
+                cx.notify();
+            }
+        }));
+
+        // Only matters while the theme is set to follow the system, but the check is cheap
+        // and the subscription has to exist before the user switches to it.
+        app._appearance = Some(cx.observe_window_appearance(window, |this, window, cx| {
+            if this.active_settings().theme == ThemeMode::System {
+                let theme = Theme::for_mode(is_dark(window.appearance()));
+                cx.set_global(theme);
+                cx.notify();
+            }
+        }));
+
+        // Pasting a link is the whole point of the app, so start with the cursor already
+        // in the command bar. Deferred to the next frame because the field does not
+        // exist as a focusable element until it has been rendered once.
+        cx.on_next_frame(window, |this, window, cx| {
+            window.focus(&this.focus, cx);
+        });
+
+        app.boot(cx);
+        app
+    }
+
+    /// Start the engine, then poll it forever. Both loops end with the view.
+    fn boot(&mut self, cx: &mut Context<Self>) {
+        let dir = self.download_dir.clone();
+        let options = self.engine_options();
+        cx.spawn(async move |this, cx| {
+            let started = cx
+                .background_spawn(async move { Aria2::start(&dir, &options) })
+                .await;
+            this.update(cx, |this, cx| {
+                match started {
+                    Ok(engine) => {
+                        this.aria2 = Some(Arc::new(engine));
+                        this.engine = Engine::Online;
+                        this.store.log(Event::EngineReady, None, None, None);
+                    }
+                    Err(err) => {
+                        this.engine = Engine::Failed(format!("{err:#}"));
+                        this.store
+                            .log(Event::EngineFailed, None, None, Some(&format!("{err:#}")));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL).await;
+
+                let engine = this.update(cx, |this, _| this.aria2.clone()).ok().flatten();
+                let snapshot = match engine {
+                    Some(engine) => {
+                        Some(cx.background_spawn(async move { engine.snapshot() }).await)
+                    }
+                    None => None,
+                };
+                let alive = this
+                    .update(cx, |this, cx| {
+                        // The caret rides the poll tick: we repaint this often anyway,
+                        // so blinking costs nothing extra.
+                        this.caret_on = !this.caret_on;
+
+                        match snapshot {
+                            Some(Ok(snapshot)) => {
+                                this.failures = 0;
+                                this.engine = Engine::Online;
+                                this.apply(snapshot);
+                            }
+                            Some(Err(err)) => {
+                                this.failures += 1;
+                                if this.failures >= FAILURE_TOLERANCE {
+                                    this.engine = Engine::Failed(format!("{err:#}"));
+                                }
+                            }
+                            None => {}
+                        }
+
+                        if this.dirty {
+                            this.save_settings();
+                            this.dirty = false;
+                        }
+                        this.flush();
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    // ---------------------------------------------------------------- derived data
+
+    /// Indices into `tasks`, in display order for the active filter: running work first
+    /// (downloading, then queued, then paused), newest finished work after that.
+    pub fn visible(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..self.tasks.len())
+            .filter(|&i| self.filter.matches(self.tasks[i].status))
+            .collect();
+        indices.sort_by_key(|&i| {
+            let task = &self.tasks[i];
+            match task.status.is_terminal() {
+                true => (1u8, 0u8, u64::MAX - task.seq),
+                false => (0u8, task.status.rank(), task.seq),
+            }
+        });
+        indices
+    }
+
+    /// Bytes per second across the rows that are moving, summed on demand.
+    ///
+    /// Never stored: the aggregate used to be a field that only a successful poll refreshed, so
+    /// pausing left its last speed on screen until the next tick came back. See
+    /// [`total_speed`](crate::model::total_speed) for why the engine's own total is not an
+    /// option either.
+    pub fn speed(&self) -> u64 {
+        total_speed(&self.tasks)
+    }
+
+    pub fn count(&self, filter: Filter) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| filter.matches(task.status))
+            .count()
+    }
+
+    pub fn index_of(&self, seq: u64) -> Option<usize> {
+        self.tasks.iter().position(|task| task.seq == seq)
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.seq;
+        self.seq += 1;
+        seq
+    }
+
+    // ---------------------------------------------------------------- user actions
+
+    pub fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
+        if self.filter != filter {
+            self.filter = filter;
+            cx.notify();
+        }
+    }
+
+    /// Queue whatever is in the command bar: the quick path, with no per-task overrides.
+    pub fn submit(&mut self, cx: &mut Context<Self>) {
+        let uri = self.input.text().trim().to_string();
+        if uri.is_empty() {
+            return;
+        }
+        if !looks_like_uri(&uri) {
+            self.warn(self.strings().bad_uri, cx);
+            return;
+        }
+        if !self.engine_ready(cx) {
+            return;
+        }
+        let request = self.quick_request(uri, self.download_dir.clone());
+        self.input.clear();
+        self.enqueue(request, None, cx);
+    }
+
+    // ---------------------------------------------------------------- add-download dialog
+
+    /// Open the advanced dialog, pre-filled from the quick bar and the current engine settings.
+    pub fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.add_dialog.is_some() {
+            return;
+        }
+        let mut dialog = AddDialog::new(cx);
+        dialog.connections = self.settings.connections.clamp(1, 16);
+        dialog.set(AddField::Uri, self.input.text());
+        dialog.set(
+            AddField::Dir,
+            self.download_dir.to_string_lossy().into_owned(),
+        );
+        dialog.set(
+            AddField::UserAgent,
+            self.settings.user_agent.clone().unwrap_or_default(),
+        );
+        dialog.set(
+            AddField::Proxy,
+            self.settings.proxy.clone().unwrap_or_default(),
+        );
+        let uri = dialog.focus(AddField::Uri).clone();
+        self.add_dialog = Some(dialog);
+        window.focus(&uri, cx);
+        cx.notify();
+    }
+
+    pub fn close_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.add_dialog.is_some() {
+            // Move focus out *before* the dialog (and its focus handles) is dropped, so the window
+            // is never left pointing at a handle that no longer exists.
+            window.focus(&self.focus, cx);
+            self.add_dialog = None;
+            cx.notify();
+        }
+    }
+
+    /// Queue the dialog's download and close it.
+    pub fn start_add_download(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Take the text out first so the immutable borrow of the dialog ends before the mutable
+        // calls below.
+        let (uri, typed_dir) = {
+            let Some(dialog) = self.add_dialog.as_ref() else {
+                return;
+            };
+            (
+                dialog.text(AddField::Uri).trim().to_string(),
+                dialog.text(AddField::Dir).trim().to_string(),
+            )
+        };
+        if uri.is_empty() {
+            return;
+        }
+        if !looks_like_uri(&uri) {
+            self.warn(self.strings().bad_uri, cx);
+            return;
+        }
+        if !self.engine_ready(cx) {
+            return;
+        }
+        let dir = if typed_dir.is_empty() {
+            self.download_dir.clone()
+        } else {
+            PathBuf::from(typed_dir)
+        };
+        let request = self.dialog_request(&uri, dir);
+        let name = request.file_name.clone();
+        // Back to the quick bar, ready for the next paste.
+        window.focus(&self.focus, cx);
+        self.add_dialog = None;
+        self.enqueue(request, name, cx);
+    }
+
+    /// Pick a folder for the open dialog's "save to" box.
+    pub fn choose_add_dir(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.strings().choose_folder.into()),
+        });
+
+        cx.spawn(async move |this, cx| {
+            let picked = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(err)) => {
+                    this.update(cx, |this, cx| {
+                        let message = format!("{}: {err}", this.strings().picker_failed);
+                        this.warn(message, cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            if let Some(dir) = picked {
+                this.update(cx, |this, _| {
+                    if let Some(dialog) = this.add_dialog.as_mut() {
+                        dialog.set(AddField::Dir, dir.to_string_lossy().into_owned());
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    pub fn set_add_connections(&mut self, value: u32, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.add_dialog.as_mut() {
+            dialog.connections = value;
+            cx.notify();
+        }
+    }
+
+    pub fn set_add_speed_limit(&mut self, value: u64, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.add_dialog.as_mut() {
+            dialog.speed_limit = value;
+            cx.notify();
+        }
+    }
+
+    /// Whether a download can be queued at all; warns and returns `false` otherwise.
+    fn engine_ready(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.aria2.is_some() {
+            return true;
+        }
+        let strings = self.strings();
+        let message = match &self.engine {
+            Engine::Failed(reason) => format!("{}: {reason}", strings.engine_unavailable),
+            _ => strings.engine_starting.to_string(),
+        };
+        self.warn(message, cx);
+        false
+    }
+
+    /// A download from the quick bar: the global engine settings, no per-task overrides.
+    fn quick_request(&self, uri: String, dir: PathBuf) -> DownloadRequest {
+        let engine = self.engine_options();
+        DownloadRequest {
+            uri,
+            dir: dir.to_string_lossy().into_owned(),
+            file_name: None,
+            user_agent: engine.user_agent,
+            connections: engine.connections,
+            proxy: engine.proxy,
+            max_tries: engine.max_tries,
+            timeout: engine.timeout,
+            speed_limit: 0,
+            referer: None,
+        }
+    }
+
+    /// A download from the dialog: the per-task overrides the user chose.
+    fn dialog_request(&self, uri: &str, dir: PathBuf) -> DownloadRequest {
+        let Some(dialog) = self.add_dialog.as_ref() else {
+            return self.quick_request(uri.to_string(), dir);
+        };
+        // Retries and timeout stay global; the dialog only overrides what is genuinely per-task.
+        let engine = self.engine_options();
+        DownloadRequest {
+            uri: uri.to_string(),
+            dir: dir.to_string_lossy().into_owned(),
+            file_name: non_empty(dialog.text(AddField::Name)),
+            user_agent: non_empty(dialog.text(AddField::UserAgent)),
+            connections: dialog.connections.clamp(1, 16),
+            proxy: non_empty(dialog.text(AddField::Proxy)),
+            max_tries: engine.max_tries,
+            timeout: engine.timeout,
+            speed_limit: dialog.speed_limit,
+            referer: non_empty(dialog.text(AddField::Referer)),
+        }
+    }
+
+    /// Create the row, record it, and hand the request to the engine. Shared by the quick bar and
+    /// the add-download dialog so the bookkeeping only exists once.
+    fn enqueue(&mut self, request: DownloadRequest, name: Option<String>, cx: &mut Context<Self>) {
+        let seq = self.next_seq();
+        let uri = request.uri.clone();
+        let mut task = Task::placeholder(seq, uri.clone(), request.dir.clone());
+        if let Some(name) = name {
+            task.name = name;
+        }
+        // Record it before the engine even acknowledges the request: if aria2 rejects the URI the
+        // row is removed again, and the attempt is still in the log.
+        self.store.upsert_download(&task, task.created_at);
+        self.store
+            .log(Event::Added, Some(seq), Some(&task.name), Some(&uri));
+        self.seen.insert(seq, (task.status, task.completed));
+        self.tasks.push(task);
+        self.dirty = true;
+        cx.notify();
+
+        self.dispatch(
+            cx,
+            move |aria2| aria2.add_uri(&request),
+            move |this, result, cx| {
+                match result {
+                    Ok(gid) => {
+                        if let Some(task) = this.tasks.iter_mut().find(|task| task.seq == seq) {
+                            task.gid = Some(gid);
+                        }
+                        this.dirty = true;
+                    }
+                    Err(err) => {
+                        this.tasks.retain(|task| task.seq != seq);
+                        this.seen.remove(&seq);
+                        // The row was written before the engine answered so the attempt would
+                        // show up in the log; hide it now that it is known to have gone nowhere.
+                        this.store.mark_deleted(seq);
+                        this.store
+                            .log(Event::Failed, Some(seq), None, Some(&format!("{err:#}")));
+                        let message = format!("{}: {err:#}", this.strings().add_failed);
+                        this.warn(message, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Pause a running download, or resume a paused one.
+    pub fn toggle(&mut self, seq: u64, cx: &mut Context<Self>) {
+        match self.index_of(seq).map(|index| self.tasks[index].status) {
+            Some(Status::Active | Status::Waiting) => self.pause(seq, cx),
+            Some(Status::Paused) => self.resume(seq, cx),
+            Some(Status::Error) => self.retry(seq, cx),
+            _ => {}
+        }
+    }
+
+    fn pause(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(seq) else {
+            return;
+        };
+        let Some(gid) = self.tasks[index].gid.clone() else {
+            return;
+        };
+        // Reflect the intent immediately; the next poll confirms it.
+        self.tasks[index].status = Status::Paused;
+        self.tasks[index].speed = 0;
+        self.dirty = true;
+        cx.notify();
+
+        self.dispatch(
+            cx,
+            move |aria2| aria2.pause(&gid),
+            move |this, result, cx| {
+                if let Err(err) = result {
+                    this.warn(format!("{}: {err:#}", this.strings().pause_failed), cx);
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn resume(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(seq) else {
+            return;
+        };
+        // With no gid aria2 has never seen this task — it is fresh, or it was restored
+        // after a restart. Re-queueing the URI lets `--continue` pick up the partial
+        // file where it left off.
+        let Some(gid) = self.tasks[index].gid.clone() else {
+            return self.requeue(seq, cx);
+        };
+
+        self.tasks[index].status = Status::Waiting;
+        self.dirty = true;
+        cx.notify();
+
+        self.dispatch(
+            cx,
+            move |aria2| aria2.unpause(&gid),
+            move |this, result, cx| {
+                if result.is_err() {
+                    // The gid went stale; fall back to re-queueing.
+                    this.requeue(seq, cx);
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn retry(&mut self, seq: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.index_of(seq) {
+            self.tasks[index].gid = None;
+        }
+        self.requeue(seq, cx);
+    }
+
+    /// Hand a task's URI back to aria2 and adopt the new gid.
+    fn requeue(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(seq) else {
+            return;
+        };
+        let Some(uri) = self.tasks[index].primary_uri().map(str::to_string) else {
+            self.warn(self.strings().bad_uri, cx);
+            return;
+        };
+        let dir = self.download_dir.clone();
+        let request = self.quick_request(uri, dir);
+
+        self.tasks[index].gid = None;
+        self.tasks[index].status = Status::Waiting;
+        self.tasks[index].error = None;
+        self.dirty = true;
+        cx.notify();
+
+        self.dispatch(
+            cx,
+            move |aria2| aria2.add_uri(&request),
+            move |this, result, cx| {
+                let Some(index) = this.index_of(seq) else {
+                    return;
+                };
+                match result {
+                    Ok(gid) => this.tasks[index].gid = Some(gid),
+                    Err(err) => {
+                        this.tasks[index].status = Status::Error;
+                        this.tasks[index].error = Some(format!("{err:#}"));
+                    }
+                }
+                this.dirty = true;
+                cx.notify();
+            },
+        );
+    }
+
+    /// Ask before dropping a row, but only when there is a file to ask about.
+    pub fn request_remove(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(seq) else {
+            return;
+        };
+        let path = self.tasks[index].path();
+        if !path.exists() {
+            // Nothing was ever written (metadata never arrived, or the file was moved
+            // away by hand), so there is no question worth asking.
+            self.remove_now(vec![seq], false, cx);
+            return;
+        }
+
+        let task = &self.tasks[index];
+        let size = on_disk_size(&path).map(fmt_size).unwrap_or_default();
+        self.confirm = Some(Confirm {
+            heading: self.strings().remove_one.to_string(),
+            subject: task.name.clone(),
+            size,
+            facts: vec![task.dir.clone()],
+            seqs: vec![seq],
+        });
+        cx.notify();
+    }
+
+    /// The same question, for the whole finished list at once.
+    pub fn request_clear_finished(&mut self, cx: &mut Context<Self>) {
+        let seqs: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter(|task| task.status.is_terminal())
+            .map(|task| task.seq)
+            .collect();
+        if seqs.is_empty() {
+            return;
+        }
+
+        let on_disk: Vec<(String, u64)> = self
+            .tasks
+            .iter()
+            .filter(|task| task.status.is_terminal())
+            .filter_map(|task| {
+                let path = task.path();
+                has_download_data(&path)
+                    .then(|| (task.name.clone(), on_disk_size(&path).unwrap_or(0)))
+            })
+            .collect();
+
+        if on_disk.is_empty() {
+            self.remove_now(seqs, false, cx);
+            return;
+        }
+
+        let bytes: u64 = on_disk.iter().map(|(_, bytes)| bytes).sum();
+        let size = if bytes > 0 {
+            fmt_size(bytes)
+        } else {
+            String::new()
+        };
+        let detail = self.strings().files_on_disk(on_disk.len(), &size);
+        self.confirm = Some(Confirm {
+            heading: self.strings().remove_many.to_string(),
+            subject: String::new(),
+            size: String::new(),
+            facts: vec![detail],
+            seqs,
+        });
+        cx.notify();
+    }
+
+    /// Resolve the open dialog. `delete_files` decides whether the bytes go too.
+    pub fn resolve_confirm(&mut self, delete_files: bool, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm.take() else {
+            return;
+        };
+        self.remove_now(confirm.seqs, delete_files, cx);
+    }
+
+    pub fn dismiss_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Drop rows from the list, tell aria2 to forget them, and optionally erase the files.
+    ///
+    /// The engine call has to land before the delete — aria2 holds the file open, and on
+    /// Windows an open handle can make the removal fail. That ordering is why both happen
+    /// inside one background task rather than in two detached ones.
+    fn remove_now(&mut self, seqs: Vec<u64>, delete_files: bool, cx: &mut Context<Self>) {
+        let engine = self.aria2.clone();
+        let mut gids: Vec<(String, bool)> = Vec::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let mut doomed: Vec<(u64, String)> = Vec::new();
+
+        for seq in seqs {
+            let Some(index) = self.index_of(seq) else {
+                continue;
+            };
+            let task = self.tasks.remove(index);
+            let finished = task.status.is_terminal();
+            let path = delete_files.then(|| task.path());
+            if let Some(gid) = task.gid {
+                gids.push((gid, finished));
+            }
+            if let Some(path) = path {
+                paths.push(path);
+            }
+            doomed.push((task.seq, task.name));
+        }
+        if doomed.is_empty() {
+            return;
+        }
+
+        cx.notify();
+
+        // The log records the intent, not just the aftermath, so a removal that also wipes
+        // files is distinguishable from one that only forgot the task.
+        for (seq, name) in &doomed {
+            self.store.log(Event::Removed, Some(*seq), Some(name), None);
+        }
+        if delete_files {
+            for path in &paths {
+                let shown = path.to_string_lossy().into_owned();
+                self.store
+                    .log(Event::FilesDeleted, None, None, Some(&shown));
+            }
+        }
+        for (seq, _) in &doomed {
+            self.seen.remove(seq);
+            // Hidden, not erased: the row is the record of what happened, and `seq` has to stay
+            // taken so a later download cannot inherit this one's history.
+            self.store.mark_deleted(*seq);
+        }
+
+        cx.spawn(async move |this, cx| {
+            let leftovers = cx
+                .background_spawn(async move {
+                    if let Some(engine) = engine {
+                        for (gid, finished) in gids {
+                            if finished {
+                                let _ = engine.forget(&gid);
+                            } else {
+                                // Removing a live download also leaves a "removed" record
+                                // behind, so sweep that up too. A failure there is purely
+                                // cosmetic.
+                                let _ = engine.remove(&gid);
+                                let _ = engine.forget(&gid);
+                            }
+                        }
+                    }
+                    paths
+                        .into_iter()
+                        .filter_map(|path| discard_download(&path).map(|err| (path, err)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+
+            // The row is already gone by now, so a file that refused to go would otherwise
+            // reappear in Explorer with nothing to explain it.
+            if leftovers.is_empty() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                for (path, err) in leftovers {
+                    let message =
+                        format!("{} {}: {err}", this.strings().delete_failed, path.display());
+                    this.warn(message, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ------------------------------------------------------------------------ settings
+
+    /// What the settings sheet shows and edits: the draft while it is open, the saved settings
+    /// otherwise. Reading the whole UI through this is what makes theme, language, font and path
+    /// preview live while still keeping every one of them out of the database until Save.
+    pub fn active_settings(&self) -> &Settings {
+        self.draft.as_ref().unwrap_or(&self.settings)
+    }
+
+    /// Open the preferences sheet on a snapshot of the saved settings. Nothing it edits touches
+    /// disk until [`Self::commit_settings`]; [`Self::cancel_settings`] throws the snapshot away.
+    pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_open {
+            return;
+        }
+        self.draft = Some(self.settings.clone());
+        self.settings_open = true;
+        self.load_setting_drafts();
+        cx.notify();
+    }
+
+    /// Save what the sheet has been editing, then close it.
+    pub fn commit_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        self.settings = draft;
+        if let Some(dir) = self
+            .settings
+            .download_dir
+            .clone()
+            .filter(|dir| !dir.is_empty())
+        {
+            let dir = PathBuf::from(dir);
+            // The picker only returns folders that exist, but a path restored from a state file
+            // may since have been removed; recreate it now that the user has confirmed.
+            let _ = std::fs::create_dir_all(&dir);
+            self.download_dir = dir;
+        }
+        // Write now rather than on the next poll tick. "Save" has to mean the bytes are on disk
+        // even if the process dies a moment later, and the write is one transaction anyway.
+        self.save_settings();
+        self.apply_global_settings(cx);
+        self.close_settings(window, cx);
+    }
+
+    /// Throw the sheet's edits away and restore what was last saved.
+    pub fn cancel_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.take().is_none() {
+            return;
+        }
+        // The theme was installed live as a preview; put the stored one back.
+        cx.set_global(Theme::for_mode(
+            self.settings.theme.is_dark(is_dark(window.appearance())),
+        ));
+        self.close_settings(window, cx);
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.font_menu_open = false;
+        // The text boxes are the draft's other half; reload them so a reopened sheet never shows
+        // what was typed and then abandoned.
+        self.load_setting_drafts();
+        // The command bar is the app's default keyboard target. Clicking the gear blurs it (a
+        // click landed outside the box), so hand focus back when the sheet closes — otherwise the
+        // user would have to click the bar before pasting the next link.
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Point the three text boxes at the saved settings. Called on open and on close, so the
+    /// buffers never outlive the sheet they belong to.
+    fn load_setting_drafts(&mut self) {
+        self.font_draft
+            .set(self.settings.font.clone().unwrap_or_default());
+        self.ua_draft
+            .set(self.settings.user_agent.clone().unwrap_or_default());
+        self.proxy_draft
+            .set(self.settings.proxy.clone().unwrap_or_default());
+    }
+
+    /// The active translation table. `'static`, so callers can hold on to a string while
+    /// still mutating the app.
+    pub fn strings(&self) -> &'static Strings {
+        i18n::Strings::get(self.active_settings().language)
+    }
+
+    pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.language != language {
+            draft.language = language;
+            cx.notify();
+        }
+    }
+
+    pub fn set_theme_mode(&mut self, mode: ThemeMode, window: &Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.theme == mode {
+            return;
+        }
+        draft.theme = mode;
+        // Installed live so the user sees the palette before committing; Cancel puts the saved
+        // one back.
+        cx.set_global(Theme::for_mode(mode.is_dark(is_dark(window.appearance()))));
+        cx.notify();
+    }
+
+    /// The whole UI paints and measures with this. One place decides the family and the
+    /// fallback chain, so no view has to know how the list is spelled.
+    pub fn ui_font(&self, window: &Window) -> Font {
+        let mut font = window.text_style().font();
+        if let Some((family, fallbacks)) = self.resolved_font() {
+            font.family = family.into();
+            font.fallbacks = (!fallbacks.is_empty()).then(|| FontFallbacks::from_fonts(fallbacks));
+        }
+        font
+    }
+
+    /// The installed families to draw with, most preferred first.
+    ///
+    /// Names the platform does not know are dropped rather than passed through: GPUI asks the
+    /// platform for the primary family and, when that fails, jumps straight to the system
+    /// default, so an unknown first entry would silently discard the user's second choice.
+    pub fn resolved_font(&self) -> Option<(String, Vec<String>)> {
+        let mut families: Vec<String> = Vec::new();
+        for name in font_stack(self.active_settings().font.as_deref()?) {
+            let Some(installed) = self
+                .fonts
+                .iter()
+                .find(|family| family.eq_ignore_ascii_case(&name))
+            else {
+                continue;
+            };
+            if !families.iter().any(|family| family == installed) {
+                families.push(installed.clone());
+            }
+        }
+        let mut families = families.into_iter();
+        let primary = families.next()?;
+        Some((primary, families.collect()))
+    }
+
+    /// Families asked for that are not installed, so the settings page can say which entries
+    /// lost instead of leaving the user to guess.
+    pub fn missing_fonts(&self) -> Vec<String> {
+        font_stack(self.active_settings().font.as_deref().unwrap_or_default())
+            .into_iter()
+            .filter(|name| {
+                !self
+                    .fonts
+                    .iter()
+                    .any(|family| family.eq_ignore_ascii_case(name))
+            })
+            .collect()
+    }
+
+    /// The font box was edited. The draft is the source of truth while typing; what lands in
+    /// the pending settings is its trimmed, empty-aware form.
+    pub fn font_text_changed(&mut self, cx: &mut Context<Self>) {
+        let trimmed = self.font_draft.text().trim();
+        let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        if let Some(draft) = self.draft.as_mut() {
+            draft.font = next;
+        }
+        cx.notify();
+    }
+
+    /// The user-agent box was edited. Empty means "keep the built-in agent".
+    pub fn ua_text_changed(&mut self, cx: &mut Context<Self>) {
+        let next = non_empty(self.ua_draft.text());
+        if let Some(draft) = self.draft.as_mut() {
+            draft.user_agent = next;
+        }
+        cx.notify();
+    }
+
+    /// The proxy box was edited. Empty means "no proxy".
+    pub fn proxy_text_changed(&mut self, cx: &mut Context<Self>) {
+        let next = non_empty(self.proxy_draft.text());
+        if let Some(draft) = self.draft.as_mut() {
+            draft.proxy = next;
+        }
+        cx.notify();
+    }
+
+    // ---------------------------------------------------------------- engine preferences
+
+    /// The engine preferences as aria2 wants them. Read on every `addUri`, so changing a
+    /// setting reaches the next download without restarting the engine.
+    fn engine_options(&self) -> EngineOptions {
+        EngineOptions {
+            user_agent: self.settings.user_agent.clone(),
+            // Clamp what a hand-edited database could put here: aria2 rejects
+            // `--max-connection-per-server` above 16 and refuses to start, which would leave the
+            // app with a dead engine and no obvious cause.
+            connections: self.settings.connections.clamp(1, 16),
+            max_concurrent: self.settings.max_concurrent.max(1),
+            speed_limit: self.settings.speed_limit,
+            proxy: self.settings.proxy.clone(),
+            max_tries: self.settings.max_tries,
+            timeout: self.settings.timeout.max(1),
+        }
+    }
+
+    /// Push the engine-wide preferences to a running aria2. Per-download options do not need
+    /// this — they travel with the next `addUri`.
+    fn apply_global_settings(&self, cx: &mut Context<Self>) {
+        let Some(engine) = self.aria2.clone() else {
+            return;
+        };
+        let options = self.engine_options();
+        // Best effort: if the engine has gone away the poll loop reports it, and the settings
+        // page already has a banner for that.
+        cx.background_spawn(async move {
+            let _ = engine.apply_global(&options);
+        })
+        .detach();
+    }
+
+    pub fn set_connections(&mut self, value: u32, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.connections != value {
+            draft.connections = value;
+            cx.notify();
+        }
+    }
+
+    pub fn set_max_concurrent(&mut self, value: u32, cx: &mut Context<Self>) {
+        // Only staged: the running engine is told on Save (see `commit_settings`), because a
+        // modal sheet gives the user nothing to watch it against.
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.max_concurrent != value {
+            draft.max_concurrent = value;
+            cx.notify();
+        }
+    }
+
+    pub fn set_speed_limit(&mut self, value: u64, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.speed_limit != value {
+            draft.speed_limit = value;
+            cx.notify();
+        }
+    }
+
+    pub fn set_max_tries(&mut self, value: u32, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.max_tries != value {
+            draft.max_tries = value;
+            cx.notify();
+        }
+    }
+
+    pub fn set_timeout(&mut self, value: u32, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.timeout != value {
+            draft.timeout = value;
+            cx.notify();
+        }
+    }
+
+    /// Stage the folder the picker returned. The folder is created, and becomes the one new
+    /// downloads use, only on Save; existing rows keep the directory they were started in.
+    pub fn set_download_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        let next = dir.to_string_lossy().into_owned();
+        if draft.download_dir.as_deref() != Some(next.as_str()) {
+            draft.download_dir = Some(next);
+            cx.notify();
+        }
+    }
+
+    /// Ask the platform for a folder. GPUI routes this to a native `IFileOpenDialog` with
+    /// folder selection enabled, parented to the active window, and the answer arrives on
+    /// the channel returned here.
+    pub fn choose_download_dir(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.strings().choose_folder.into()),
+        });
+
+        cx.spawn(async move |this, cx| {
+            let picked = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                // Cancelled, or the platform had nothing to give us.
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(err)) => {
+                    this.update(cx, |this, cx| {
+                        let message = format!("{}: {err}", this.strings().picker_failed);
+                        this.warn(message, cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            if let Some(dir) = picked {
+                this.update(cx, |this, cx| this.set_download_dir(dir, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Open the folder the history database lives in.
+    pub fn reveal_store_dir(&mut self, cx: &mut Context<Self>) {
+        if let Some(dir) = self.store.path().parent().map(Path::to_path_buf) {
+            self.reveal_dir(dir, cx);
+        }
+    }
+
+    /// Open a folder itself in the system file manager.
+    pub fn reveal_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        cx.background_spawn(async move { open_folder(&dir) })
+            .detach();
+    }
+
+    /// Show the finished file (or its folder) in the system file manager.
+    pub fn reveal(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(seq) else {
+            return;
+        };
+        let file = self.tasks[index].path();
+        let dir = self.tasks[index].dir.clone();
+        cx.background_spawn(async move { reveal_in_file_manager(&file, &dir) })
+            .detach();
+    }
+
+    // ------------------------------------------------------------------------- text fields
+
+    /// Read-only access to an editable field, for the callers that only measure or draw.
+    pub fn field(&self, field: Field) -> Option<&TextEdit> {
+        Some(match field {
+            Field::Link => &self.input,
+            Field::Font => &self.font_draft,
+            Field::FontSearch => &self.font_query,
+            Field::UserAgent => &self.ua_draft,
+            Field::Proxy => &self.proxy_draft,
+            Field::Add(which) => self.add_dialog.as_ref()?.edit(which),
+        })
+    }
+
+    /// The inverse of [`NexusApp::active_field`]: which handle owns a given field. Views need both
+    /// halves to build a box, and keeping the mapping here means a new `Field` variant can only be
+    /// added in one place.
+    pub fn focus_handle(&self, field: Field) -> Option<&FocusHandle> {
+        Some(match field {
+            Field::Link => &self.focus,
+            Field::Font => &self.font_focus,
+            Field::FontSearch => &self.search_focus,
+            Field::UserAgent => &self.ua_focus,
+            Field::Proxy => &self.proxy_focus,
+            Field::Add(which) => self.add_dialog.as_ref()?.focus(which),
+        })
+    }
+
+    pub fn field_mut(&mut self, field: Field) -> Option<&mut TextEdit> {
+        Some(match field {
+            Field::Link => &mut self.input,
+            Field::Font => &mut self.font_draft,
+            Field::FontSearch => &mut self.font_query,
+            Field::UserAgent => &mut self.ua_draft,
+            Field::Proxy => &mut self.proxy_draft,
+            Field::Add(which) => &mut self.add_dialog.as_mut()?.edits[which as usize],
+        })
+    }
+
+    /// Which field the platform is talking about, or `None` when nothing is focused.
+    ///
+    /// The platform's events carry no field, only the view, so the focused handle is what
+    /// identifies the target. `None` is a real answer now that clicking outside a box blurs it
+    /// (see the `on_mouse_down_out` in `ui::text_field`): an unfocused box must not receive keys
+    /// or input, so callers never fall back to the command bar.
+    pub fn active_field(&self, window: &Window) -> Option<Field> {
+        if self.font_focus.is_focused(window) {
+            return Some(Field::Font);
+        }
+        if self.search_focus.is_focused(window) {
+            return Some(Field::FontSearch);
+        }
+        if self.ua_focus.is_focused(window) {
+            return Some(Field::UserAgent);
+        }
+        if self.proxy_focus.is_focused(window) {
+            return Some(Field::Proxy);
+        }
+        if self.focus.is_focused(window) {
+            return Some(Field::Link);
+        }
+        self.add_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.focused(window))
+            .map(Field::Add)
+    }
+
+    /// A press inside a field: put the caret where the click landed and start a selection.
+    pub fn press_field(
+        &mut self,
+        field: Field,
+        along: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.index_for_x(field, along, window);
+        if let Some(edit) = self.field_mut(field) {
+            edit.set_cursor(index, false);
+        }
+        self.dragging = Some(field);
+        cx.notify();
+    }
+
+    /// Extend a selection while the button is held down.
+    pub fn drag_field(
+        &mut self,
+        field: Field,
+        along: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging != Some(field) {
+            return;
+        }
+        let index = self.index_for_x(field, along, window);
+        if let Some(edit) = self.field_mut(field) {
+            edit.set_cursor(index, true);
+        }
+        cx.notify();
+    }
+
+    /// The byte offset a point `along` the line lands on. Shaped with the font the field is drawn
+    /// with, so the answer matches the pixels the user is pointing at.
+    pub fn index_for_x(&self, field: Field, along: f32, window: &Window) -> usize {
+        let Some(edit) = self.field(field) else {
+            return 0;
+        };
+        let font = self.ui_font(window);
+        let Some(line) = text_field::shape(edit.text(), text_field::size(field), window, &font)
+        else {
+            return edit.len();
+        };
+        line.closest_index_for_x(px(along))
+    }
+
+    fn shape_field(&self, field: Field, window: &Window) -> Option<gpui::ShapedLine> {
+        let font = self.ui_font(window);
+        text_field::shape(
+            self.field(field)?.text(),
+            text_field::size(field),
+            window,
+            &font,
+        )
+    }
+
+    /// A field's contents changed. The font box mirrors a setting; the others exist purely to be
+    /// read when the user presses Enter, so repainting is all they need.
+    pub fn field_changed(&mut self, field: Field, cx: &mut Context<Self>) {
+        match field {
+            Field::Font => self.font_text_changed(cx),
+            Field::UserAgent => self.ua_text_changed(cx),
+            Field::Proxy => self.proxy_text_changed(cx),
+            // The URL bar is only read when the user presses Enter, so repainting is enough.
+            Field::Link | Field::FontSearch | Field::Add(_) => cx.notify(),
+        }
+    }
+
+    /// Show or hide the font picker. Whatever the panel does with focus, it hands it back to the
+    /// box it belongs to when it closes — otherwise the caret would be left in an element that is
+    /// no longer drawn, and the keyboard would go nowhere at all.
+    pub fn toggle_font_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.font_menu_open = !self.font_menu_open;
+        if self.font_menu_open {
+            self.font_query.clear();
+            window.focus(&self.search_focus, cx);
+        } else {
+            window.focus(&self.font_focus, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn close_font_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.font_menu_open {
+            self.font_menu_open = false;
+            window.focus(&self.font_focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Append a family to the font list. Quoted when it has spaces, exactly as the box's own
+    /// parser expects, and skipped when it is already there.
+    pub fn choose_font(&mut self, family: &str, cx: &mut Context<Self>) {
+        let entry = if family.contains(' ') {
+            format!("\"{family}\"")
+        } else {
+            family.to_string()
+        };
+        let current = self.font_draft.text().to_string();
+        let mut names: Vec<String> = crate::settings::font_stack(&current);
+        if names.iter().any(|name| name == family) {
+            return;
+        }
+        names.push(entry);
+        let joined = names.join(", ");
+        self.font_draft.set(joined);
+        self.font_text_changed(cx);
+    }
+
+    /// The installed families matching the picker's filter, in display order.
+    pub fn font_matches(&self) -> Vec<&str> {
+        let query = self.font_query.text().trim().to_lowercase();
+        self.fonts
+            .iter()
+            .filter(|family| query.is_empty() || family.to_lowercase().contains(&query))
+            .map(String::as_str)
+            .collect()
+    }
+
+    // ---------------------------------------------------------------- engine sync
+
+    /// Fold one poll's worth of engine state into the list.
+    fn apply(&mut self, snapshot: Snapshot) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for entry in &snapshot.tasks {
+            let Some(gid) = entry["gid"].as_str() else {
+                continue;
+            };
+            seen.insert(gid);
+            let Some(task) = self
+                .tasks
+                .iter_mut()
+                .find(|task| task.gid.as_deref() == Some(gid))
+            else {
+                // Downloads are only ever created by this app — we own a private aria2
+                // instance — so an unrecognised gid is leftover engine state. Ignore it
+                // rather than inventing a row for it.
+                continue;
+            };
+            let before = task.status;
+            task.absorb(entry);
+            if before != task.status {
+                self.dirty = true;
+            }
+        }
+
+        // A task the engine no longer reports is not running any more.
+        for task in self.tasks.iter_mut() {
+            let stale = task.gid.as_deref().is_some_and(|gid| !seen.contains(gid));
+            if stale && task.status.is_live() {
+                task.status = Status::Paused;
+                task.speed = 0;
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn warn(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let message = message.into();
+        self.notice = Some(message.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(6)).await;
+            this.update(cx, |this, cx| {
+                if this.notice.as_deref() == Some(message.as_str()) {
+                    this.notice = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Run one RPC call off the UI thread and hand the outcome back to the view.
+    fn dispatch<T, W, D>(&self, cx: &mut Context<Self>, work: W, done: D)
+    where
+        T: Send + 'static,
+        W: FnOnce(&Aria2) -> anyhow::Result<T> + Send + 'static,
+        D: FnOnce(&mut NexusApp, anyhow::Result<T>, &mut Context<NexusApp>) + 'static,
+    {
+        let Some(engine) = self.aria2.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { work(&engine) }).await;
+            this.update(cx, |this, cx| done(this, result, cx)).ok();
+        })
+        .detach();
+    }
+
+    // ---------------------------------------------------------------- persistence
+
+    /// Persist the preferences. Cheap enough to do whenever something changes.
+    fn save_settings(&self) {
+        self.settings.save(&self.store);
+    }
+
+    /// Write task rows that moved and log the transitions since the last call.
+    ///
+    /// A status change is written (and logged) immediately; byte counters ride the
+    /// `PROGRESS_FLUSH` timer. Comparing against `seen` rather than a dirty flag means no
+    /// transition can slip through between flushes.
+    fn flush(&mut self) {
+        if !self.store.enabled() {
+            return;
+        }
+        let now = Instant::now();
+        let due = now.duration_since(self.last_flush) >= PROGRESS_FLUSH;
+
+        let mut pending: Vec<(Task, Option<Status>)> = Vec::new();
+        for task in &self.tasks {
+            let previous = self.seen.get(&task.seq).copied();
+            if previous == Some((task.status, task.completed)) {
+                continue;
+            }
+            let status_changed = previous.map(|(status, _)| status) != Some(task.status);
+            if status_changed || due {
+                pending.push((task.clone(), previous.map(|(status, _)| status)));
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        if due {
+            self.last_flush = now;
+        }
+
+        for (task, previous) in pending {
+            self.store.upsert_download(&task, task.created_at);
+            self.seen.insert(task.seq, (task.status, task.completed));
+            if previous != Some(task.status)
+                && let Some(event) = Event::for_status(previous, task.status)
+            {
+                self.store.log(
+                    event,
+                    Some(task.seq),
+                    Some(&task.name),
+                    task.error.as_deref(),
+                );
+            }
+        }
+    }
+
+    /// One-time move of `state.json` into the database. The file is renamed rather than
+    /// deleted so the previous history is still recoverable by hand.
+    fn import_legacy(&mut self) {
+        if !self.store.enabled() || !self.store.is_empty() {
+            return;
+        }
+        for task in &self.tasks {
+            self.store.upsert_download(task, task.created_at);
+        }
+        self.save_settings();
+        let _ = std::fs::rename(state_file(), data_dir().join("state.json.imported"));
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Persisted {
+    #[serde(default)]
+    tasks: Vec<Task>,
+    #[serde(default)]
+    download_dir: Option<String>,
+    #[serde(default)]
+    settings: Settings,
+}
+
+impl Persisted {
+    fn load() -> Self {
+        std::fs::read_to_string(state_file())
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Where the app keeps its state: the directory it was started in. Portable on purpose — the
+/// database, the log and any one-time import backup sit beside whatever the user launched,
+/// instead of being buried in the profile. Falls back to the temp directory if the process has
+/// no working directory at all.
+pub fn data_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// Whether a platform appearance should be treated as dark. GPUI reports four variants;
+/// only the `Vibrant`-prefixed ones are the light counterparts.
+fn is_dark(appearance: WindowAppearance) -> bool {
+    matches!(
+        appearance,
+        WindowAppearance::Dark | WindowAppearance::VibrantDark
+    )
+}
+
+fn state_file() -> PathBuf {
+    data_dir().join("state.json")
+}
+
+fn default_download_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|home| home.join("Downloads"))
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(|| data_dir().join("downloads"))
+}
+
+/// `Some` for a non-blank, trimmed string; `None` for empty. Used by the optional engine
+/// settings, where "unset" has exactly one in-memory spelling.
+fn non_empty(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Accept the schemes aria2 understands; anything else is probably prose.
+fn looks_like_uri(input: &str) -> bool {
+    const SCHEMES: [&str; 8] = [
+        "http://",
+        "https://",
+        "ftp://",
+        "sftp://",
+        "magnet:",
+        "thunder://",
+        "ed2k://",
+        "http+unix://",
+    ];
+    let lower = input.to_ascii_lowercase();
+    SCHEMES.iter().any(|scheme| lower.starts_with(scheme))
+}
+
+/// Is there anything of a download on disk yet? aria2 writes a `<file>.aria2` control file as
+/// soon as it starts, which can exist while the payload itself does not.
+fn has_download_data(path: &Path) -> bool {
+    path.exists() || control_file(path).exists()
+}
+
+fn control_file(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.aria2", path.display()))
+}
+
+/// Erase what a forgotten download left on disk. `None` on success, otherwise the OS message for
+/// why the bytes are still there.
+///
+/// aria2 keeps a `.aria2` control file beside a partial download, and a torrent's payload is a
+/// directory rather than a file, so both shapes have to be handled. The retry exists because
+/// Windows hangs on to the handle for a moment after the engine is told to forget the download,
+/// and a single `remove_file` can lose that race.
+fn discard_download(path: &Path) -> Option<String> {
+    // aria2 deletes this itself the moment a download finishes, so a failure says nothing.
+    let _ = std::fs::remove_file(control_file(path));
+
+    let mut last = String::new();
+    for attempt in 0..DELETE_TRIES {
+        match remove_target(path) {
+            Ok(()) => return None,
+            // Gone is the goal, no matter who got there first.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => last = err.to_string(),
+        }
+        if attempt + 1 < DELETE_TRIES {
+            std::thread::sleep(DELETE_RETRY);
+        }
+    }
+    Some(last)
+}
+
+fn remove_target(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Size of what is on disk at `path`, or `None` when it is a directory: a directory's own
+/// metadata length says nothing useful about the payload inside it.
+fn on_disk_size(path: &Path) -> Option<u64> {
+    if path.is_dir() {
+        return None;
+    }
+    std::fs::metadata(path).ok().map(|meta| meta.len())
+}
+
+fn reveal_in_file_manager(file: &Path, dir: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = Command::new("explorer.exe");
+        if file.exists() {
+            command.arg(format!("/select,{}", file.display()));
+        } else {
+            command.arg(dir);
+        }
+        let _ = command.creation_flags(CREATE_NO_WINDOW).spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        let _ = Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// Open a folder in the system file manager.
+///
+/// Deliberately **not** `explorer /select`, which is what [`reveal_in_file_manager`] uses for a
+/// file: `/select,<folder>` highlights the folder *inside its parent*, so "open the download
+/// folder" landed the user one level up with the folder selected. Passing the path on its own opens
+/// the folder itself.
+fn open_folder(dir: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new("explorer.exe")
+            .arg(dir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// The platform's view of the focused field.
+///
+/// This is not optional decoration: on Windows the IME delivers both its composition and its
+/// committed characters **only** through the input handler, and `WM_CHAR` is routed there too. A
+/// windowed app with no `EntityInputHandler` therefore types nothing at all in Chinese (and only
+/// gets ASCII through the `key_char` fallback on `WM_KEYDOWN`).
+impl EntityInputHandler for NexusApp {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let edit = self.field(self.active_field(window)?)?;
+        let bytes = edit.utf16_to_bytes(range);
+        adjusted.replace(
+            byte_to_utf16(edit.text(), bytes.start)..byte_to_utf16(edit.text(), bytes.end),
+        );
+        edit.text().get(bytes).map(str::to_string)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let edit = self.field(self.active_field(window)?)?;
+        let (range, reversed) = edit.utf16_range();
+        Some(UTF16Selection { range, reversed })
+    }
+
+    fn marked_text_range(
+        &self,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let edit = self.field(self.active_field(window)?)?;
+        let marked = edit.marked()?;
+        Some(byte_to_utf16(edit.text(), marked.start)..byte_to_utf16(edit.text(), marked.end))
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = self.active_field(window) else {
+            return;
+        };
+        if let Some(edit) = self.field_mut(field) {
+            edit.unmark();
+        }
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(field) = self.active_field(window) else {
+            return;
+        };
+        let range = match self.field(field) {
+            Some(edit) => range.map(|range| edit.utf16_to_bytes(range)),
+            None => return,
+        };
+        if let Some(edit) = self.field_mut(field) {
+            edit.insert_at(range, &one_line(text));
+        }
+        self.field_changed(field, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(field) = self.active_field(window) else {
+            return;
+        };
+        let range = match self.field(field) {
+            Some(edit) => range.map(|range| edit.utf16_to_bytes(range)),
+            None => return,
+        };
+        let caret = new_selected_range.map(|range| utf16_to_byte(new_text, range.start));
+        if let Some(edit) = self.field_mut(field) {
+            edit.insert_marked_at(range, &one_line(new_text), caret);
+        }
+        self.field_changed(field, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let field = self.active_field(window)?;
+        let line = self.shape_field(field, window)?;
+        // The scroll offset is recomputed from the element's real width instead of read back from
+        // the frame: `render` can only estimate the width, and a few pixels of disagreement moves
+        // nothing but the IME's candidate window.
+        let edit = self.field(field)?;
+        let bytes = edit.utf16_to_bytes(range_utf16);
+        let available = element_bounds.size.width.as_f32().max(0.0);
+        let font = self.ui_font(window);
+        let shift = text_field::caret_shift(
+            edit.text(),
+            edit.cursor(),
+            text_field::size(field),
+            window,
+            &font,
+            available,
+        );
+        Some(text_field::range_bounds(
+            &line,
+            bytes,
+            element_bounds,
+            shift,
+            window.line_height(),
+        ))
+    }
+
+    /// Not called by the Windows backend, which positions its candidate window from
+    /// `bounds_for_range` alone. `None` is the honest answer rather than a wrong offset.
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// The IME moves the caret through this one.
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(field) = self.active_field(window) else {
+            return;
+        };
+        let bytes = match self.field(field) {
+            Some(edit) => edit.utf16_to_bytes(range_utf16),
+            None => return,
+        };
+        if let Some(edit) = self.field_mut(field) {
+            edit.set_cursor(bytes.start, false);
+        }
+        cx.notify();
+    }
+
+    fn text_length_utf16(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
+        Some(self.field(self.active_field(window)?)?.utf16_len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    /// A fresh directory of our own, named with the process id so parallel tests cannot collide.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nexus-state-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point of the button: the payload goes, not just the record of it.
+    #[test]
+    fn discarding_removes_the_payload_and_the_control_file() {
+        let dir = scratch("payload");
+        let file = dir.join("archlinux.iso");
+        std::fs::write(&file, b"pretend this is 1.5 GB").unwrap();
+        std::fs::write(control_file(&file), b"aria2 control").unwrap();
+
+        assert!(discard_download(&file).is_none());
+        assert!(!file.exists(), "the download itself should be gone");
+        assert!(!control_file(&file).exists());
+    }
+
+    /// A torrent's payload is a directory, and `remove_file` on one fails with a sharing or
+    /// permission error rather than doing the right thing.
+    #[test]
+    fn discarding_removes_a_whole_payload_directory() {
+        let dir = scratch("tree");
+        let payload = dir.join("ubuntu");
+        std::fs::create_dir_all(payload.join("nested")).unwrap();
+        std::fs::write(payload.join("nested").join("vmlinuz"), b"kernel").unwrap();
+
+        assert!(discard_download(&payload).is_none());
+        assert!(!payload.exists());
+    }
+
+    /// "Already gone" is the goal, so it must not be reported as a failure — this is the path a
+    /// user hits after deleting the file in Explorer first.
+    #[test]
+    fn discarding_something_already_gone_is_not_an_error() {
+        let dir = scratch("missing");
+        assert!(discard_download(&dir.join("never-existed.iso")).is_none());
+    }
+
+    /// What the delete button promises, both halves at once: the bytes go, the record stays.
+    ///
+    /// Each half has its own test, but they live in different modules and are easy to get out of
+    /// step — the row half changed most recently, and it must not have taken the file with it.
+    #[test]
+    fn forgetting_a_download_erases_the_bytes_but_keeps_the_row() {
+        let dir = scratch("forget");
+        let file = dir.join("archlinux.iso");
+        std::fs::write(&file, b"pretend this is 1.5 GB").unwrap();
+
+        let store = Store::open(dir.join("nexus.db"));
+        let task = Task::placeholder(
+            1,
+            "https://example.com/archlinux.iso".into(),
+            dir.display().to_string(),
+        );
+        store.upsert_download(&task, task.created_at);
+        assert_eq!(store.counts().0, 1);
+
+        // `remove_now` with `delete_files = true`, in the order it does them.
+        store.mark_deleted(1);
+        assert!(discard_download(&file).is_none());
+
+        assert!(!file.exists(), "the file still has to be deleted");
+        assert!(store.load_downloads().is_empty(), "and it leaves the list");
+        assert_eq!(store.counts().0, 1, "but the row is not deleted");
+        assert_eq!(store.highest_seq(), 1, "nor is its number given away");
+    }
+}
