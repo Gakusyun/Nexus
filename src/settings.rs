@@ -62,15 +62,6 @@ impl ThemeMode {
             _ => None,
         }
     }
-
-    /// Resolve against what the platform is currently reporting.
-    pub fn is_dark(self, system_is_dark: bool) -> bool {
-        match self {
-            ThemeMode::Light => false,
-            ThemeMode::Dark => true,
-            ThemeMode::System => system_is_dark,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

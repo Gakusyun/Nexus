@@ -3,30 +3,24 @@
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, ClickEvent, ColorExt, Context, FontWeight, IntoElement, KeyDownEvent, Render,
-    Rgba, Window, WindowControlArea, div, px, rgb,
+    Window, div, px,
 };
 
 use super::settings::settings_dialog;
 use super::text_field::{self, Outcome, apply_key};
+use nexus_look::IconButton as LookIconButton;
 use super::{
-    CONNECTIONS, CONTROL, CONTROL_GAP, Chip, IconButton, Modal, TextButton, Variant, hint, icon,
+    CONNECTIONS, CONTROL, CONTROL_GAP, Chip, Modal, TextButton, Variant, hint, icon,
     segmented, setting_row, speed_options,
 };
 use crate::i18n::Strings;
 use crate::model::fmt_speed;
 use crate::state::{AddField, Engine, Field, Filter, NexusApp};
-use crate::theme::Theme;
+use nexus_look::Theme;
 
 /// Horizontal page gutter. Also used to derive the width available to the URL field.
-pub const PAGE_PADDING: f32 = 20.0;
-const BAR_PADDING: f32 = 16.0;
-const BAR_ICON: f32 = 17.0;
-const GAP_ICON: f32 = 11.0;
+pub const PAGE_PADDING: f32 = 24.0;
 const GAP_BUTTON: f32 = 12.0;
-const BUTTON_WIDTH: f32 = 108.0;
-const BUTTON_HEIGHT: f32 = 38.0;
-const COMMAND_HEIGHT: f32 = 54.0;
-const INPUT_FONT: f32 = 13.5;
 
 impl Render for NexusApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -46,13 +40,7 @@ impl Render for NexusApp {
             // bubble here, and `active_field` says which buffer they belong to — far safer than
             // hoping each box's own node ends up on the focus dispatch path.
             .on_key_down(cx.listener(handle_keys))
-            .child(title_bar(
-                &theme,
-                strings,
-                self.maximized,
-                self.settings_open,
-                cx,
-            ))
+            .child(title_bar(strings, self.settings_open, window, cx))
             .child(self.body(strings, &theme, window, cx))
             .when_some(self.confirm.as_ref(), |element, confirm| {
                 element.child(confirm_dialog(confirm, strings, &theme, window, cx))
@@ -123,126 +111,23 @@ impl NexusApp {
 
 // ---------------------------------------------------------------------- title bar
 
+/// The title bar is the library's: the drag strip, the four window controls and the rule about
+/// which of them may contain the others are all in `nexus_look::TitleBar`. Nexus supplies the
+/// product mark, the name and the gear.
 fn title_bar(
-    theme: &Theme,
     strings: &Strings,
-    maximized: bool,
     settings_open: bool,
+    window: &Window,
     cx: &mut Context<NexusApp>,
 ) -> impl IntoElement + use<> {
-    let (text, accent) = (theme.text, theme.accent);
-    let (muted, hover_bg, danger) = (theme.text_muted, theme.surface_hover, theme.danger);
-
-    div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .h(px(46.0))
-        .pl(px(19.0))
-        .pr(px(9.0))
-        .child(
-            // The drag strip must be a *sibling* of the window buttons, never their
-            // ancestor. The platform resolves a hit test by walking the window-control
-            // hitboxes in registration order and taking the first match, and paint
-            // registers a parent before its children. So a `Drag` area on an ancestor
-            // captures the whole strip: pressing Minimise/Maximise/Close returns
-            // `HTCAPTION`, and the buttons never see `HTMINBUTTON`/`HTMAXBUTTON`/
-            // `HTCLOSE` — the window just drags instead. Keeping `Drag` on this branch
-            // (and the buttons a sibling) leaves exactly one control area under the
-            // cursor over the buttons.
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .flex_1()
-                .h_full()
-                .gap(px(9.0))
-                .window_control_area(WindowControlArea::Drag)
-                .child(icon("icons/logo.svg", 17.0, accent))
-                .child(
-                    div()
-                        .text_size(px(13.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(text)
-                        .child(strings.app_name),
-                ),
-        )
-        .child(
-            // A plain button, not a window control: it has to sit outside the drag strip (see
-            // the note above), so it gets its own hitbox and an ordinary click handler.
-            div().flex_none().mr(px(6.0)).child(
-                IconButton::new(
-                    "open-settings",
-                    0,
-                    "icons/gear.svg",
-                    if settings_open { accent } else { muted },
-                    if settings_open { accent } else { text },
-                )
-                .hover_bg(hover_bg)
+    nexus_look::TitleBar::new(strings.app_name)
+        .logo("icons/logo.svg")
+        .action(
+            LookIconButton::new("open-settings", nexus_look::icons::GEAR)
                 .active(settings_open)
-                .box_size(30.0)
-                .radius(8.0)
-                .glyph_size(14.0)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_settings(cx))),
-            ),
         )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                .child(window_button(
-                    "win-min",
-                    "icons/min.svg",
-                    WindowControlArea::Min,
-                    muted,
-                    hover_bg,
-                    muted,
-                ))
-                // The area stays `Max` either way: the platform maps it to
-                // `HTMAXBUTTON`, which the OS already toggles between maximise and
-                // restore on its own. Only the glyph has to follow the state.
-                .child(window_button(
-                    "win-max",
-                    if maximized {
-                        "icons/restore.svg"
-                    } else {
-                        "icons/max.svg"
-                    },
-                    WindowControlArea::Max,
-                    muted,
-                    hover_bg,
-                    muted,
-                ))
-                .child(window_button(
-                    "win-close",
-                    "icons/x.svg",
-                    WindowControlArea::Close,
-                    muted,
-                    danger,
-                    rgb(0xffffff),
-                )),
-        )
-}
-
-/// A native window control: the platform handles the click via the control area, so there is no
-/// handler here on purpose.
-fn window_button(
-    id: &'static str,
-    glyph: &'static str,
-    area: WindowControlArea,
-    tint: Rgba,
-    hover_bg: Rgba,
-    hover_tint: Rgba,
-) -> impl IntoElement + use<> {
-    IconButton::new(id, 0, glyph, tint, hover_tint)
-        .hover_bg(hover_bg)
-        .box_size(30.0)
-        .radius(8.0)
-        .glyph_size(13.0)
-        .area(area)
+        .build(window, cx)
 }
 
 // -------------------------------------------------------------------- command bar
@@ -251,97 +136,38 @@ fn command_bar(
     this: &NexusApp,
     strings: &'static Strings,
     theme: &Theme,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<NexusApp>,
 ) -> impl IntoElement + use<> {
-    let focused = this.focus.is_focused(window);
-    let filled = !this.input.text().trim().is_empty();
+    let filled = !this.input.read(cx).text().trim().is_empty();
     let ready = matches!(this.engine, Engine::Online);
     let enabled = filled && ready;
-    let (accent, faint) = (theme.accent, theme.text_faint);
-    // Long links would otherwise be clipped at exactly the point the user is typing, so the row
-    // slides left to keep the caret in view. The measurement needs the field's own font rather
-    // than the window default, which during `render` still reports its own style.
-    let font = this.ui_font(window);
 
-    let submit = TextButton::new("command-submit", strings.add, Variant::Hero)
-        .leading("icons/plus.svg", 15.0)
-        .width(BUTTON_WIDTH)
-        .enabled(enabled)
-        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.submit(cx)))
-        .into_any_element();
+    let submit = nexus_look::Button::primary("command-submit", strings.add)
+        .large()
+        .icon(nexus_look::icons::PLUS)
+        .disabled(!enabled)
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.submit(cx)));
 
     // The advanced path. The quick bar stays the one-paste default; this opens the dialog for a
     // download that needs its own name, folder, user agent or connection count.
-    let advanced = IconButton::new(
-        "open-advanced",
-        0,
-        "icons/sliders.svg",
-        theme.text_muted,
-        theme.text,
-    )
-    .hover_bg(theme.surface_hover)
-    .box_size(BUTTON_HEIGHT)
-    .radius(11.0)
-    .glyph_size(17.0)
-    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_add_dialog(window, cx)));
+    let advanced = LookIconButton::new("open-advanced", "icons/sliders.svg")
+        .large()
+        .outlined()
+        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open_add_dialog(window, cx)));
 
-    let trailing = div()
+    div()
         .flex()
         .flex_row()
-        .flex_none()
         .items_center()
+        .flex_none()
         .gap(px(GAP_BUTTON))
+        .px(px(PAGE_PADDING))
+        .py(px(nexus_look::space::MD))
+        .bg(theme.surface)
+        .child(div().flex_1().min_w(px(0.0)).child(this.input.clone()))
         .child(submit)
         .child(advanced)
-        .into_any_element();
-
-    text_field::field(
-        text_field::FieldSpec {
-            id: "command-bar",
-            target: Field::Link,
-            edit: &this.input,
-            focus: &this.focus,
-            placeholder: strings.placeholder,
-            caret_on: this.caret_on,
-            metrics: text_field::Metrics {
-                size: INPUT_FONT,
-                height: COMMAND_HEIGHT,
-                radius: 15.0,
-                padding: BAR_PADDING,
-                chrome: input_chrome(),
-                gap: GAP_ICON,
-                bg: theme.surface,
-                width: text_field::Width::Full,
-            },
-            leading: Some(
-                icon(
-                    "icons/link.svg",
-                    BAR_ICON,
-                    if focused { accent } else { faint },
-                )
-                .into_any_element(),
-            ),
-            trailing: Some(trailing),
-        },
-        theme,
-        &font,
-        window,
-        cx,
-    )
-}
-
-/// Everything on the command bar's row except the text itself, which is what the caret has to
-/// measure against to know when the line must scroll.
-fn input_chrome() -> f32 {
-    PAGE_PADDING * 2.0
-        + BAR_PADDING * 2.0
-        + BAR_ICON
-        + GAP_ICON
-        + GAP_BUTTON
-        + BUTTON_WIDTH
-        + GAP_BUTTON
-        + BUTTON_HEIGHT
 }
 
 // ------------------------------------------------------------------- keyboard input
@@ -364,6 +190,21 @@ fn handle_keys(
     if this.confirm.is_some() {
         if key == "escape" {
             this.dismiss_confirm(cx);
+        }
+        return;
+    }
+
+    // The command bar owns its own editing keys — the library's input buffers, moves the caret and
+    // talks to the IME itself. What is left for the app is what Enter and Escape *mean* here, and
+    // only the app can know that.
+    if this.input.read(cx).focus_handle().is_focused(window) {
+        match key {
+            "enter" => this.submit(cx),
+            "escape" => {
+                this.notice = None;
+                cx.notify();
+            }
+            _ => {}
         }
         return;
     }
@@ -394,11 +235,11 @@ fn handle_keys(
     let outcome = apply_key(edit, event, cx);
     match outcome {
         Outcome::Handled => this.field_changed(field, cx),
-        Outcome::Submit => match field {
-            Field::Link => this.submit(cx),
-            Field::Add(_) => this.start_add_download(window, cx),
-            _ => {}
-        },
+        Outcome::Submit => {
+            if field == Field::Add(AddField::Uri) {
+                this.start_add_download(window, cx);
+            }
+        }
         Outcome::Dismiss => {
             // Escape closes the topmost layer in one step: the add dialog, then the font picker,
             // then the settings card.
@@ -408,9 +249,6 @@ fn handle_keys(
                 this.close_font_menu(window, cx);
             } else if this.settings_open {
                 this.cancel_settings(window, cx);
-            } else if field == Field::Link {
-                this.notice = None;
-                cx.notify();
             } else {
                 window.blur();
                 cx.notify();

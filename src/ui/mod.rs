@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::i18n::Strings;
 use crate::model::Status;
-use crate::theme::Theme;
+use nexus_look::Theme;
 
 /// An icon, tinted explicitly.
 ///
@@ -115,11 +115,6 @@ impl IconButton {
 
     pub fn outlined(mut self) -> Self {
         self.outlined = true;
-        self
-    }
-
-    pub fn area(mut self, area: WindowControlArea) -> Self {
-        self.area = Some(area);
         self
     }
 
@@ -226,13 +221,6 @@ impl TextButton {
         self
     }
 
-    /// A disabled button is dimmed, refuses the cursor and ignores clicks. Only [`Variant::Hero`]
-    /// uses it — every other button is always actionable.
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-
     pub fn width(mut self, width: f32) -> Self {
         self.width = Some(width);
         self
@@ -263,7 +251,7 @@ impl RenderOnce for TextButton {
 
         let fill: Background = match (variant, enabled) {
             (Variant::Hero, false) => theme.surface_hover.into(),
-            (Variant::Hero, true) => theme.sweep(),
+            (Variant::Hero, true) => theme.accent.into(),
             (Variant::Primary, _) => theme.accent_wash.into(),
             (Variant::Danger, _) => theme.danger_wash.into(),
             _ => rgba(0x00000000).into(),
@@ -438,7 +426,7 @@ impl RenderOnce for ProgressBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx);
         let fill: Background = match self.tone {
-            Tone::Accent => theme.sweep(),
+            Tone::Accent => theme.accent.into(),
             Tone::Success => theme.success.into(),
             Tone::Danger => theme.danger.into(),
         };

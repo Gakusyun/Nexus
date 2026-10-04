@@ -7,7 +7,7 @@ use super::{IconButton, ProgressBar, StatusBadge, Tone};
 use crate::i18n::Strings;
 use crate::model::{Status, Task, fmt_eta, fmt_percent, fmt_size, fmt_speed};
 use crate::state::NexusApp;
-use crate::theme::Theme;
+use nexus_look::Theme;
 
 pub(super) fn task_row(
     task: Task,

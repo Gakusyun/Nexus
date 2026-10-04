@@ -16,8 +16,6 @@ mod model;
 mod settings;
 mod state;
 mod store;
-mod text_edit;
-mod theme;
 mod ui;
 
 use std::io::Write;
@@ -26,13 +24,20 @@ use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions
 
 use crate::state::NexusApp;
 
+/// Nexus's default accent: the purple of the logo. A user's own choice overrides it; see the
+/// settings sheet.
+pub const NEXUS_ACCENT: u32 = 0x7c5cff;
+
 fn main() {
     install_log();
 
     gpui_platform::application()
-        .with_assets(assets::Assets)
+        .with_assets(nexus_look::Assets.chain(assets::Assets))
         .run(|cx: &mut App| {
-            theme::init(cx);
+            // The look is the project's half of the design language: the accent that makes Nexus
+            // look like Nexus, and nothing else. Everything about how it is painted comes from
+            // Nexus-look's `STYLE.md`.
+            nexus_look::init(cx, nexus_look::Look::new().accent(NEXUS_ACCENT));
 
             let bounds = Bounds::centered(None, size(px(960.0), px(660.0)), cx);
             cx.open_window(

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AppContext, Bounds, Context, EntityInputHandler, FocusHandle, Font, FontFallbacks,
-    PathPromptOptions, Pixels, Subscription, UTF16Selection, Window, WindowAppearance, px,
+    Entity, PathPromptOptions, Pixels, Subscription, UTF16Selection, Window, px,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,9 +22,13 @@ use crate::i18n::{self, Strings};
 use crate::model::{Status, Task, fmt_size, total_speed};
 use crate::settings::{Language, Settings, ThemeMode, font_stack};
 use crate::store::{Event, Store};
-use crate::text_edit::{TextEdit, byte_to_utf16, one_line, utf16_to_byte};
-use crate::theme::Theme;
 use crate::ui::text_field;
+// The stored `ThemeMode` is this app's — it has a serde shape for the legacy importer. The
+// library's has the same three names and no persistence, which is the right split: how a
+// preference is spelled in a database file is not a design-language decision.
+use nexus_look::ThemeMode as LookMode;
+use nexus_look::widgets::text_edit::{byte_to_utf16, one_line, utf16_to_byte};
+use nexus_look::{Look, TextEdit, TextInput};
 
 /// How often we ask aria2 for fresh numbers.
 const POLL: Duration = Duration::from_millis(500);
@@ -52,8 +56,6 @@ const DELETE_RETRY: Duration = Duration::from_millis(250);
 /// thing that says which one that is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Field {
-    /// The URL bar.
-    Link,
     /// The font family list.
     Font,
     /// The font picker's filter.
@@ -197,9 +199,10 @@ pub struct NexusApp {
     pub engine: Engine,
     pub filter: Filter,
     pub download_dir: PathBuf,
-    /// The command bar's URL field.
-    pub input: TextEdit,
-    pub focus: FocusHandle,
+    /// The command bar's URL field. An entity of its own — the library's input owns its buffer,
+    /// its focus handle, its caret and its IME bridge, so there is nothing left for the app to
+    /// hold on its behalf.
+    pub input: Entity<TextInput>,
     pub caret_on: bool,
     pub notice: Option<String>,
     /// Mirrors the platform window state, refreshed by `observe_window_bounds`, so the
@@ -317,9 +320,7 @@ impl NexusApp {
             .unwrap_or(0)
             .max(store.highest_seq())
             + 1;
-        let focus = cx.focus_handle();
-        let font_focus = cx.focus_handle();
-        let search_focus = cx.focus_handle();
+        let font_focus = cx.focus_handle();        let search_focus = cx.focus_handle();
         let mut font_draft = TextEdit::default();
         font_draft.set(settings.font.clone().unwrap_or_default());
         let font_query = TextEdit::default();
@@ -334,10 +335,12 @@ impl NexusApp {
         // platform's.
         let mut fonts = cx.text_system().all_font_names();
         fonts.sort_by_key(|family| family.to_lowercase());
+        // The command bar. The placeholder is the app's, so it is set from the active language
+        // rather than baked into the widget.
+        let placeholder = i18n::Strings::get(settings.language).placeholder;
+        let input = cx.new(|cx| TextInput::new(cx, placeholder).large());
         // Apply the stored palette before the first frame paints.
-        cx.set_global(Theme::for_mode(
-            settings.theme.is_dark(is_dark(window.appearance())),
-        ));
+        Look::update(cx, |look| look.mode = look_mode(settings.theme));
 
         // Remember what the database already knows, so the first flush neither rewrites
         // unchanged rows nor logs events for downloads that were recorded last session.
@@ -351,8 +354,7 @@ impl NexusApp {
             engine: Engine::Connecting,
             filter: Filter::All,
             download_dir,
-            input: TextEdit::default(),
-            focus,
+            input,
             caret_on: true,
             notice: None,
             maximized,
@@ -404,10 +406,9 @@ impl NexusApp {
 
         // Only matters while the theme is set to follow the system, but the check is cheap
         // and the subscription has to exist before the user switches to it.
-        app._appearance = Some(cx.observe_window_appearance(window, |this, window, cx| {
+        app._appearance = Some(cx.observe_window_appearance(window, |this, _window, cx| {
             if this.active_settings().theme == ThemeMode::System {
-                let theme = Theme::for_mode(is_dark(window.appearance()));
-                cx.set_global(theme);
+                Look::update(cx, |look| look.mode = LookMode::System);
                 cx.notify();
             }
         }));
@@ -416,7 +417,8 @@ impl NexusApp {
         // in the command bar. Deferred to the next frame because the field does not
         // exist as a focusable element until it has been rendered once.
         cx.on_next_frame(window, |this, window, cx| {
-            window.focus(&this.focus, cx);
+            let handle = this.input.read(cx).focus_handle().clone();
+            window.focus(&handle, cx);
         });
 
         app.boot(cx);
@@ -554,7 +556,7 @@ impl NexusApp {
 
     /// Queue whatever is in the command bar: the quick path, with no per-task overrides.
     pub fn submit(&mut self, cx: &mut Context<Self>) {
-        let uri = self.input.text().trim().to_string();
+        let uri = self.input.read(cx).text().trim().to_string();
         if uri.is_empty() {
             return;
         }
@@ -566,7 +568,7 @@ impl NexusApp {
             return;
         }
         let request = self.quick_request(uri, self.download_dir.clone());
-        self.input.clear();
+        self.input.update(cx, |input, cx| input.clear(cx));
         self.enqueue(request, None, cx);
     }
 
@@ -579,7 +581,7 @@ impl NexusApp {
         }
         let mut dialog = AddDialog::new(cx);
         dialog.connections = self.settings.connections.clamp(1, 16);
-        dialog.set(AddField::Uri, self.input.text());
+        dialog.set(AddField::Uri, self.input.read(cx).text());
         dialog.set(
             AddField::Dir,
             self.download_dir.to_string_lossy().into_owned(),
@@ -602,7 +604,8 @@ impl NexusApp {
         if self.add_dialog.is_some() {
             // Move focus out *before* the dialog (and its focus handles) is dropped, so the window
             // is never left pointing at a handle that no longer exists.
-            window.focus(&self.focus, cx);
+            let handle = self.input.read(cx).focus_handle().clone();
+            window.focus(&handle, cx);
             self.add_dialog = None;
             cx.notify();
         }
@@ -639,7 +642,8 @@ impl NexusApp {
         let request = self.dialog_request(&uri, dir);
         let name = request.file_name.clone();
         // Back to the quick bar, ready for the next paste.
-        window.focus(&self.focus, cx);
+        let handle = self.input.read(cx).focus_handle().clone();
+        window.focus(&handle, cx);
         self.add_dialog = None;
         self.enqueue(request, name, cx);
     }
@@ -1117,6 +1121,9 @@ impl NexusApp {
         // even if the process dies a moment later, and the write is one transaction anyway.
         self.save_settings();
         self.apply_global_settings(cx);
+        // A committed language change has to reach the command bar, which is older than the
+        // setting it is now quoting.
+        self.sync_placeholder(cx);
         self.close_settings(window, cx);
     }
 
@@ -1125,10 +1132,10 @@ impl NexusApp {
         if self.draft.take().is_none() {
             return;
         }
-        // The theme was installed live as a preview; put the stored one back.
-        cx.set_global(Theme::for_mode(
-            self.settings.theme.is_dark(is_dark(window.appearance())),
-        ));
+        // The theme was installed live as a preview; put the stored one back, and put the command
+        // bar's placeholder back with it (the language previews the same way the theme does).
+        Look::update(cx, |look| look.mode = look_mode(self.settings.theme));
+        self.sync_placeholder(cx);
         self.close_settings(window, cx);
     }
 
@@ -1141,8 +1148,19 @@ impl NexusApp {
         // The command bar is the app's default keyboard target. Clicking the gear blurs it (a
         // click landed outside the box), so hand focus back when the sheet closes — otherwise the
         // user would have to click the bar before pasting the next link.
-        window.focus(&self.focus, cx);
+        let handle = self.input.read(cx).focus_handle().clone();
+        window.focus(&handle, cx);
         cx.notify();
+    }
+
+    /// Keep the command bar's placeholder in step with the active language.
+    ///
+    /// The box outlives every settings change — it is the app's front door — so its placeholder
+    /// cannot be a constructor argument that only ever gets read once.
+    fn sync_placeholder(&self, cx: &mut Context<Self>) {
+        let placeholder = self.strings().placeholder;
+        self.input
+            .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
     }
 
     /// Point the three text boxes at the saved settings. Called on open and on close, so the
@@ -1168,11 +1186,13 @@ impl NexusApp {
         };
         if draft.language != language {
             draft.language = language;
+            // The placeholder previews along with the rest of the sheet.
+            self.sync_placeholder(cx);
             cx.notify();
         }
     }
 
-    pub fn set_theme_mode(&mut self, mode: ThemeMode, window: &Window, cx: &mut Context<Self>) {
+    pub fn set_theme_mode(&mut self, mode: ThemeMode, _window: &Window, cx: &mut Context<Self>) {
         let Some(draft) = self.draft.as_mut() else {
             return;
         };
@@ -1182,7 +1202,7 @@ impl NexusApp {
         draft.theme = mode;
         // Installed live so the user sees the palette before committing; Cancel puts the saved
         // one back.
-        cx.set_global(Theme::for_mode(mode.is_dark(is_dark(window.appearance()))));
+        Look::update(cx, |look| look.mode = look_mode(mode));
         cx.notify();
     }
 
@@ -1425,7 +1445,6 @@ impl NexusApp {
     /// Read-only access to an editable field, for the callers that only measure or draw.
     pub fn field(&self, field: Field) -> Option<&TextEdit> {
         Some(match field {
-            Field::Link => &self.input,
             Field::Font => &self.font_draft,
             Field::FontSearch => &self.font_query,
             Field::UserAgent => &self.ua_draft,
@@ -1439,7 +1458,6 @@ impl NexusApp {
     /// added in one place.
     pub fn focus_handle(&self, field: Field) -> Option<&FocusHandle> {
         Some(match field {
-            Field::Link => &self.focus,
             Field::Font => &self.font_focus,
             Field::FontSearch => &self.search_focus,
             Field::UserAgent => &self.ua_focus,
@@ -1450,7 +1468,6 @@ impl NexusApp {
 
     pub fn field_mut(&mut self, field: Field) -> Option<&mut TextEdit> {
         Some(match field {
-            Field::Link => &mut self.input,
             Field::Font => &mut self.font_draft,
             Field::FontSearch => &mut self.font_query,
             Field::UserAgent => &mut self.ua_draft,
@@ -1477,9 +1494,6 @@ impl NexusApp {
         }
         if self.proxy_focus.is_focused(window) {
             return Some(Field::Proxy);
-        }
-        if self.focus.is_focused(window) {
-            return Some(Field::Link);
         }
         self.add_dialog
             .as_ref()
@@ -1552,8 +1566,9 @@ impl NexusApp {
             Field::Font => self.font_text_changed(cx),
             Field::UserAgent => self.ua_text_changed(cx),
             Field::Proxy => self.proxy_text_changed(cx),
-            // The URL bar is only read when the user presses Enter, so repainting is enough.
-            Field::Link | Field::FontSearch | Field::Add(_) => cx.notify(),
+            // The remaining boxes are only read when the user presses Enter, so a repaint is
+            // enough for them.
+            Field::FontSearch | Field::Add(_) => cx.notify(),
         }
     }
 
@@ -1774,13 +1789,16 @@ pub fn data_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
-/// Whether a platform appearance should be treated as dark. GPUI reports four variants;
-/// only the `Vibrant`-prefixed ones are the light counterparts.
-fn is_dark(appearance: WindowAppearance) -> bool {
-    matches!(
-        appearance,
-        WindowAppearance::Dark | WindowAppearance::VibrantDark
-    )
+/// The palette the stored preference asks for.
+///
+/// `System` is left as `System`: the library resolves it against `App::window_appearance()`, which
+/// is the only place that knows, and re-resolves on the observer below.
+fn look_mode(mode: ThemeMode) -> LookMode {
+    match mode {
+        ThemeMode::System => LookMode::System,
+        ThemeMode::Light => LookMode::Light,
+        ThemeMode::Dark => LookMode::Dark,
+    }
 }
 
 fn state_file() -> PathBuf {

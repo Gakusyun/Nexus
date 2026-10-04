@@ -3353,10 +3353,19 @@ dependencies = [
  "anyhow",
  "gpui-ce",
  "gpui_ce_platform",
+ "nexus-look",
  "rusqlite",
  "serde",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "nexus-look"
+version = "0.1.0"
+source = "git+ssh://git@github.com/Gakusyun/Nexus-look.git?branch=main#90d8e7258011f86d32249cc692a347d3ea602e5c"
+dependencies = [
+ "gpui-ce",
 ]
 
 [[package]]
@@ -5341,7 +5350,7 @@ version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
 dependencies = [
- "skrifa 0.44.0",
+ "skrifa 0.40.0",
  "yazi",
  "zeno",
 ]

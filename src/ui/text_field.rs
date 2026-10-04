@@ -22,8 +22,9 @@ use gpui::{
 };
 
 use crate::state::{Field, NexusApp};
-use crate::text_edit::{TextEdit, one_line};
-use crate::theme::Theme;
+use nexus_look::TextEdit;
+use nexus_look::widgets::text_edit::one_line;
+use nexus_look::Theme;
 
 /// What a keystroke meant, so each field can decide what Enter or Escape does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -368,7 +369,6 @@ fn mouse(
 
 pub fn size(field: Field) -> f32 {
     match field {
-        Field::Link => 13.5,
         Field::Font | Field::FontSearch | Field::UserAgent | Field::Proxy | Field::Add(_) => 12.5,
     }
 }

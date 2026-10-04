@@ -6,7 +6,7 @@
 use crate::i18n::Strings;
 use crate::settings::{Language, ThemeMode, font_stack};
 use crate::state::{Field, NexusApp};
-use crate::theme::Theme;
+use nexus_look::Theme;
 use gpui::prelude::*;
 use gpui::{AnyElement, ClickEvent, Context, IntoElement, SharedString, Window, div, px};
 
