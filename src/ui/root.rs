@@ -225,9 +225,9 @@ fn handle_keys(
     }
 
     if key == "escape" {
-        // Escape backs out one layer at a time: the font picker, then the settings card.
-        if this.font_menu_open {
-            this.close_font_menu(window, cx);
+        // Escape backs out one layer at a time: the open panel, then the settings card.
+        if this.panel.is_some() {
+            this.close_panel(window, cx);
         } else if this.settings_open {
             this.cancel_settings(window, cx);
         }

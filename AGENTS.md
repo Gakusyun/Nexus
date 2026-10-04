@@ -207,7 +207,8 @@ STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同�
 
 - 文件：进程工作目录下的 `nexus.db`（便携式，不写 `%APPDATA%`），WAL 模式。
 - 三张表：`downloads`（当前队列 + 历史，就地更新）、`events`（**只追加**的审计日志）、
-  `settings`（键值，每项偏好一行：`theme`/`language`/`font`/`download_dir`；旧版写的
+  `settings`（键值，每项偏好一行：`theme`/`accent`/`language`/`font`/`download_dir` 等；
+  `accent` 存 6 位小写十六进制、不带 `#`（`parse_accent` 两种写法都认）；旧版写的
   `ui` JSON 行会在启动时一次性拆到这些键）。
 - 时间戳是 **ISO-8601 UTC 文本**（`2026-10-03T11:52:19Z`），列声明为 `TIMESTAMP`。
   SQLite 没有日期类型，只能存三种东西；在它们中间选文本，是因为它在任何客户端里都读得出是个时间，

@@ -1,19 +1,20 @@
 //! The settings sheet: downloads, engine, appearance, language and data.
 //!
-//! The table itself is not this file's business. `SettingGroup`, `Row` and `Modal` come from
-//! Nexus-look and the new-download dialog is built from the same three, which is what makes the
-//! two read as one product rather than as a sheet plus a stack of forms. What is here is Nexus:
-//! which preferences exist, what each control does to them, and the font picker — a platform font
-//! list behind a filter, over a comma-separated draft, which no generic widget could own.
+//! The table itself is not this file's business. `SettingGroup`, `Row`, `Modal` and `SwatchGrid`
+//! come from Nexus-look and the new-download dialog is built from the same three, which is what
+//! makes the two read as one product rather than as a sheet plus a stack of forms. What is here is
+//! Nexus: which preferences exist, what each control does to them, and the font picker — a
+//! platform font list behind a filter, over a comma-separated draft, which no generic widget
+//! could own.
 
 use crate::i18n::Strings;
-use crate::settings::{Language, ThemeMode, font_stack};
-use crate::state::NexusApp;
+use crate::settings::{DEFAULT_ACCENT, Language, ThemeMode, font_stack, parse_accent};
+use crate::state::{NexusApp, Panel};
 use gpui::prelude::*;
 use gpui::{AnyElement, App, ClickEvent, Context, Div, SharedString, Window, div, px};
 use nexus_look::{
-    Button, Choice, IconButton, Modal, RADIUS, Row, Segmented, SettingGroup, Theme, Tone, divider,
-    hint, icon, layout, space, subheading, text,
+    Button, Choice, IconButton, Modal, RADIUS, Row, Segmented, SettingGroup, SwatchGrid, Theme,
+    Tone, divider, hint, icon, layout, space, subheading, text,
 };
 
 use super::{CONNECTIONS, speed_options};
@@ -102,8 +103,17 @@ pub(super) fn settings_dialog(
             Row::new(strings.theme, strings.theme_note)
                 .control(Segmented::new("theme").choices(theme_options)),
         )
-        .child(Row::new(strings.font, strings.font_note).control(font_box(this, cx)));
-    if this.font_menu_open {
+        .child(accent_row(this, strings, cx));
+    // Read straight from the box rather than from a flag: the only way for it to be wrong is for
+    // someone to be typing in it, and a flag that a text field owns would go stale the moment
+    // something else redrew.
+    let typed = this.accent_input.read(cx).text().to_string();
+    if !typed.trim().is_empty() && parse_accent(&typed).is_none() {
+        appearance = appearance.child(hint(strings.accent_invalid, Tone::Danger, window, cx));
+    }
+    appearance =
+        appearance.child(Row::new(strings.font, strings.font_note).control(font_box(this, cx)));
+    if this.panel == Some(Panel::Fonts) {
         appearance = appearance.child(font_picker(this, strings, window, cx));
     }
     if let Some(family) = using {
@@ -272,9 +282,38 @@ fn engine_group(
         .child(hint(strings.engine_note, Tone::Neutral, window, cx))
 }
 
+/// The colour row: eight swatches, the hex box when the custom panel is open, and the way back
+/// to the default.
+///
+/// The grid and the eight presets are the library's — "which colours" is part of the language —
+/// while the two buttons and the hex box are Nexus's, because only Nexus knows the labels and what
+/// the default is.
+fn accent_row(this: &NexusApp, strings: &'static Strings, cx: &mut Context<NexusApp>) -> Row {
+    let mut swatches =
+        SwatchGrid::new("accent")
+            .selected(this.active_settings().accent)
+            // The dot and the reset point at one colour, and both live in `settings.rs`.
+            .default(DEFAULT_ACCENT)
+            .on_pick(cx.listener(|this, value: &u32, _, cx| this.set_accent(*value, cx)))
+            .action(
+                Button::ghost("accent-custom", strings.accent_custom).on_click(cx.listener(
+                    |this, _: &ClickEvent, window, cx| this.toggle_accent_panel(window, cx),
+                )),
+            )
+            .action(
+                Button::ghost("accent-reset", strings.accent_reset).on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.set_accent(DEFAULT_ACCENT, cx)),
+                ),
+            );
+    if this.panel == Some(Panel::Accent) {
+        swatches = swatches.hex(this.accent_input.clone());
+    }
+    Row::new(strings.accent, strings.accent_note).control(swatches)
+}
+
 /// The font box: the family list, plus the button that opens the picker beside it.
 fn font_box(this: &NexusApp, cx: &mut Context<NexusApp>) -> Div {
-    let open = this.font_menu_open;
+    let open = this.panel == Some(Panel::Fonts);
 
     div()
         .flex()

@@ -7,6 +7,7 @@ use crate::store::Store;
 /// Keys in the `settings` table. One row per preference, so the table stays readable with any
 /// SQLite client and adding a preference is a new field plus one line in `load`/`save`.
 pub const KEY_THEME: &str = "theme";
+pub const KEY_ACCENT: &str = "accent";
 pub const KEY_LANGUAGE: &str = "language";
 pub const KEY_FONT: &str = "font";
 pub const KEY_DOWNLOAD_DIR: &str = "download_dir";
@@ -20,6 +21,9 @@ pub const KEY_TIMEOUT: &str = "timeout";
 /// The single JSON blob the preferences lived in before they got their own rows.
 const KEY_LEGACY: &str = "ui";
 
+/// The accent Nexus is born with: the purple of the logo. The swatch grid marks it with a dot
+/// and its reset button comes back here, so this one number is both the default and the promise.
+pub const DEFAULT_ACCENT: u32 = 0x7c5cff;
 /// Segments per download (and connections per server). aria2 caps the latter at 16, so the
 /// picker never offers more.
 pub const DEFAULT_CONNECTIONS: u32 = 16;
@@ -102,6 +106,12 @@ impl Language {
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeMode,
+    /// The accent everything tinted is painted with, `0xRRGGBB`.
+    ///
+    /// Kept in the same form the library takes it — a plain integer — because that is what
+    /// `Look::accent` holds and what the swatches hand back; the database spells it as six hex
+    /// digits so a row reads as a colour in any client.
+    pub accent: u32,
     pub language: Language,
     /// The UI font family list, in CSS `font-family` order: `"Times New Roman", Simsun`.
     /// `None` (or a list nothing matches) keeps the platform default. See [`font_stack`].
@@ -124,6 +134,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeMode::default(),
+            accent: DEFAULT_ACCENT,
             language: Language::default(),
             font: None,
             download_dir: None,
@@ -150,6 +161,18 @@ pub fn font_stack(list: &str) -> Vec<String> {
         .collect()
 }
 
+/// Read a colour the way a person types one: `#7c5cff` or `7c5cff`, either case.
+///
+/// `None` for anything else, including the short `#fff` form — expanding it would mean inventing
+/// three digits the user never typed, and the box always shows the six anyway.
+pub fn parse_accent(raw: &str) -> Option<u32> {
+    let raw = raw.trim().trim_start_matches('#');
+    if raw.len() != 6 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(raw, 16).ok()
+}
+
 /// Read a numeric preference. A missing or unreadable row is `None`, so the caller keeps its
 /// default instead of silently getting a zero.
 fn number<T: std::str::FromStr>(store: &Store, key: &str) -> Option<T> {
@@ -164,6 +187,10 @@ impl Settings {
         if let Some(raw) = store.setting(KEY_THEME) {
             settings.theme = ThemeMode::parse(&raw).unwrap_or_default();
         }
+        settings.accent = store
+            .setting(KEY_ACCENT)
+            .and_then(|raw| parse_accent(&raw))
+            .unwrap_or(DEFAULT_ACCENT);
         if let Some(raw) = store.setting(KEY_LANGUAGE) {
             settings.language = Language::parse(&raw).unwrap_or_default();
         }
@@ -187,6 +214,9 @@ impl Settings {
     pub fn save(&self, store: &Store) {
         let mut writes: Vec<(&str, String)> = vec![
             (KEY_THEME, self.theme.as_str().to_string()),
+            // Six lowercase hex digits, no `#`: the row then reads as a colour in a client and
+            // parses back through [`parse_accent`], which accepts both spellings.
+            (KEY_ACCENT, format!("{:06x}", self.accent)),
             (KEY_LANGUAGE, self.language.as_str().to_string()),
             (KEY_CONNECTIONS, self.connections.to_string()),
             (KEY_MAX_CONCURRENT, self.max_concurrent.to_string()),
@@ -241,6 +271,33 @@ mod tests {
         assert_eq!(font_stack(" , MiSans ,, "), ["MiSans"]);
         assert_eq!(font_stack("Microsoft YaHei UI").len(), 1);
         assert!(font_stack("   ").is_empty());
+    }
+
+    #[test]
+    fn an_accent_round_trips_as_six_hex_digits() {
+        let path = scratch_db("accent");
+        let store = Store::open(path.clone());
+        Settings {
+            accent: 0x00ff7f,
+            ..Settings::default()
+        }
+        .save(&store);
+        // Spelled the way any client would read it: no `#`, lowercase.
+        assert_eq!(store.setting(KEY_ACCENT).as_deref(), Some("00ff7f"));
+        assert_eq!(Settings::load(&store).accent, 0x00ff7f);
+
+        // Both spellings a person might type parse; a short form or a typo never becomes a colour.
+        assert_eq!(parse_accent("#7C5CFF"), Some(0x7c5cff));
+        assert_eq!(parse_accent("7c5cff"), Some(0x7c5cff));
+        assert_eq!(parse_accent("  #7c5cff  "), Some(0x7c5cff));
+        assert_eq!(parse_accent("#fff"), None, "no short form to expand");
+        assert_eq!(parse_accent("#7c5cf"), None);
+        assert_eq!(parse_accent("#7c5czz"), None);
+        assert_eq!(parse_accent(""), None);
+
+        // A hand-edited row keeps the logo's purple instead of taking the app down.
+        store.set_setting(KEY_ACCENT, "not-a-colour");
+        assert_eq!(Settings::load(&store).accent, DEFAULT_ACCENT);
     }
 
     #[test]

@@ -181,6 +181,15 @@ pub enum Engine {
     Failed(String),
 }
 
+/// Which of the settings sheet's panels is open. At most one — see [`NexusApp::panel`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Panel {
+    /// The font list, with its filter box.
+    Fonts,
+    /// The hex box under the colour swatches.
+    Accent,
+}
+
 /// A destructive action parked until the user says what should happen to the bytes on disk.
 ///
 /// The dialog only exists when there is actually something to delete, so "remove a task whose
@@ -227,15 +236,20 @@ pub struct NexusApp {
     /// What is typed in the font box, exactly as typed. Kept apart from `settings.font` so
     /// the trimming that goes into the database cannot move the caret while the user types.
     pub font_input: Entity<TextInput>,
-    /// Whether the font picker's panel is showing.
-    pub font_menu_open: bool,
     /// The picker's filter box.
     pub font_search: Entity<TextInput>,
+    /// The hex box under the colour swatches, for a colour that is not one of the eight.
+    pub accent_input: Entity<TextInput>,
     /// What is typed in the engine's user-agent box, kept apart from `settings.user_agent` for
     /// the same reason as `font_input`: trimming must not move the caret while typing.
     pub ua_input: Entity<TextInput>,
     /// Likewise for the proxy box.
     pub proxy_input: Entity<TextInput>,
+    /// Which of the sheet's panels is showing, if any.
+    ///
+    /// One `Option` rather than a flag per panel because the two are mutually exclusive: opening
+    /// one closes the other, so Escape always has exactly one thing to close first.
+    pub panel: Option<Panel>,
     /// The font list, read from the platform once because the settings page needs it on
     /// every frame while it is open.
     pub fonts: Vec<String>,
@@ -350,6 +364,10 @@ impl NexusApp {
             Self::settings_field(cx, strings.font_search_placeholder, |_, _, _, cx| {
                 cx.notify()
             });
+        let accent_input =
+            Self::settings_field(cx, strings.accent_placeholder, |this, text, _, cx| {
+                this.set_accent_hex(text, cx)
+            });
         let ua_input =
             Self::settings_field(cx, strings.user_agent_placeholder, |this, text, _, cx| {
                 this.ua_text_changed(text, cx)
@@ -361,11 +379,18 @@ impl NexusApp {
         let font = settings.font.clone().unwrap_or_default();
         let user_agent = settings.user_agent.clone().unwrap_or_default();
         let proxy = settings.proxy.clone().unwrap_or_default();
+        let accent = format!("#{:06x}", settings.accent);
         font_input.update(cx, |field, cx| field.set_text(font, cx));
+        accent_input.update(cx, |field, cx| field.set_text(accent, cx));
         ua_input.update(cx, |field, cx| field.set_text(user_agent, cx));
         proxy_input.update(cx, |field, cx| field.set_text(proxy, cx));
-        // Apply the stored palette before the first frame paints.
-        Look::update(cx, |look| look.mode = look_mode(settings.theme));
+        // Apply the stored palette before the first frame paints. The accent comes from the
+        // database for the same reason the mode does: the look was installed with the logo's
+        // purple before anything had read a preference.
+        Look::update(cx, |look| {
+            look.mode = look_mode(settings.theme);
+            look.accent = settings.accent;
+        });
 
         // Remember what the database already knows, so the first flush neither rewrites
         // unchanged rows nor logs events for downloads that were recorded last session.
@@ -388,8 +413,9 @@ impl NexusApp {
             settings,
             draft: None,
             font_input,
-            font_menu_open: false,
             font_search,
+            accent_input,
+            panel: None,
             ua_input,
             proxy_input,
             fonts,
@@ -1149,16 +1175,20 @@ impl NexusApp {
         if self.draft.take().is_none() {
             return;
         }
-        // The theme was installed live as a preview; put the stored one back, and put the command
-        // bar's placeholder back with it (the language previews the same way the theme does).
-        Look::update(cx, |look| look.mode = look_mode(self.settings.theme));
+        // The theme and the accent were installed live as a preview; put the stored ones back,
+        // and put the placeholders back with them (the language previews the same way).
+        let (mode, accent) = (self.settings.theme, self.settings.accent);
+        Look::update(cx, |look| {
+            look.mode = look_mode(mode);
+            look.accent = accent;
+        });
         self.sync_placeholders(cx);
         self.close_settings(window, cx);
     }
 
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
-        self.font_menu_open = false;
+        self.panel = None;
         // The text boxes are the draft's other half; reload them so a reopened sheet never shows
         // what was typed and then abandoned.
         self.load_setting_drafts(cx);
@@ -1186,6 +1216,9 @@ impl NexusApp {
         self.font_search.update(cx, |input, cx| {
             input.set_placeholder(strings.font_search_placeholder, cx)
         });
+        self.accent_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.accent_placeholder, cx)
+        });
         self.ua_input.update(cx, |input, cx| {
             input.set_placeholder(strings.user_agent_placeholder, cx)
         });
@@ -1208,8 +1241,11 @@ impl NexusApp {
         let font = self.settings.font.clone().unwrap_or_default();
         let user_agent = self.settings.user_agent.clone().unwrap_or_default();
         let proxy = self.settings.proxy.clone().unwrap_or_default();
+        let accent = format!("#{:06x}", self.settings.accent);
         self.font_input
             .update(cx, |input, cx| input.set_text(font, cx));
+        self.accent_input
+            .update(cx, |input, cx| input.set_text(accent, cx));
         self.ua_input
             .update(cx, |input, cx| input.set_text(user_agent, cx));
         self.proxy_input
@@ -1246,6 +1282,43 @@ impl NexusApp {
         // one back.
         Look::update(cx, |look| look.mode = look_mode(mode));
         cx.notify();
+    }
+
+    /// The accent everything tinted is painted with. Previewed live exactly like the mode — the
+    /// sheet is a preview until Save, and Cancel puts the stored one back.
+    pub fn set_accent(&mut self, value: u32, cx: &mut Context<Self>) {
+        self.apply_accent(value, cx);
+        // A preset picked while the hex box is open has to land in the box as well: the preview
+        // beside it shows `value`, and a box still quoting the colour typed before would
+        // contradict it. The box itself never comes through here — `set_accent_hex` writes the
+        // draft directly — because writing a field's own text back into it moves the caret.
+        if self.panel == Some(Panel::Accent) {
+            let hex = format!("#{value:06x}");
+            self.accent_input
+                .update(cx, |field, cx| field.set_text(hex, cx));
+        }
+        cx.notify();
+    }
+
+    fn apply_accent(&mut self, value: u32, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.accent == value {
+            return;
+        }
+        draft.accent = value;
+        Look::update(cx, |look| look.accent = value);
+        cx.notify();
+    }
+
+    /// The hex box was edited. An unparsable colour changes nothing: the accent in force stays
+    /// the last one that made sense, and the sheet says why (it reads the box directly, so there
+    /// is no flag here to go stale).
+    fn set_accent_hex(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(value) = crate::settings::parse_accent(text) {
+            self.apply_accent(value, cx);
+        }
     }
 
     /// The whole UI paints and measures with this. One place decides the family and the
@@ -1505,11 +1578,11 @@ impl NexusApp {
         })
     }
 
-    /// What Escape means inside a settings box: the font picker first, then the sheet itself.
+    /// What Escape means inside a settings box: the open panel first, then the sheet itself.
     /// One layer at a time — the same rule the root applies when nothing at all is focused.
     fn leave_settings_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.font_menu_open {
-            self.close_font_menu(window, cx);
+        if self.panel.is_some() {
+            self.close_panel(window, cx);
         } else if self.settings_open {
             self.cancel_settings(window, cx);
         }
@@ -1540,6 +1613,7 @@ impl NexusApp {
         holds(&self.input)
             || holds(&self.font_input)
             || holds(&self.font_search)
+            || holds(&self.accent_input)
             || holds(&self.ua_input)
             || holds(&self.proxy_input)
             || self.add_dialog.as_ref().is_some_and(|dialog| {
@@ -1553,8 +1627,9 @@ impl NexusApp {
     /// box it belongs to when it closes — otherwise the caret would be left in an element that is
     /// no longer drawn, and the keyboard would go nowhere at all.
     pub fn toggle_font_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.font_menu_open = !self.font_menu_open;
-        if self.font_menu_open {
+        let opening = self.panel != Some(Panel::Fonts);
+        self.panel = opening.then_some(Panel::Fonts);
+        if opening {
             self.font_search.update(cx, |field, cx| field.clear(cx));
             self.focus_field(&self.font_search, window, cx);
         } else {
@@ -1563,11 +1638,39 @@ impl NexusApp {
         cx.notify();
     }
 
-    pub fn close_font_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.font_menu_open {
-            self.font_menu_open = false;
-            self.focus_field(&self.font_input, window, cx);
-            cx.notify();
+    /// Show or hide the hex box under the swatches. Opening it puts the current accent in the box,
+    /// so the first keystroke edits a real value instead of an empty one.
+    pub fn toggle_accent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let opening = self.panel != Some(Panel::Accent);
+        self.panel = opening.then_some(Panel::Accent);
+        if opening {
+            let hex = format!("#{:06x}", self.active_settings().accent);
+            self.accent_input
+                .update(cx, |field, cx| field.set_text(hex, cx));
+            self.focus_field(&self.accent_input, window, cx);
+        } else {
+            // The swatches are not focusable, so there is no box to hand the keyboard back to.
+            // Let go of it instead: the root then answers the next Escape itself (closing the
+            // sheet) rather than sending keys to a box that is no longer drawn.
+            window.blur();
+        }
+        cx.notify();
+    }
+
+    /// Close whichever panel is open and put the keyboard somewhere that still exists.
+    pub fn close_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.panel {
+            None => {}
+            Some(Panel::Fonts) => {
+                self.panel = None;
+                self.focus_field(&self.font_input, window, cx);
+                cx.notify();
+            }
+            Some(Panel::Accent) => {
+                self.panel = None;
+                window.blur();
+                cx.notify();
+            }
         }
     }
 

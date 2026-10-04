@@ -24,10 +24,6 @@ use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions
 
 use crate::state::NexusApp;
 
-/// Nexus's default accent: the purple of the logo. A user's own choice overrides it; see the
-/// settings sheet.
-pub const NEXUS_ACCENT: u32 = 0x7c5cff;
-
 fn main() {
     install_log();
 
@@ -36,8 +32,9 @@ fn main() {
         .run(|cx: &mut App| {
             // The look is the project's half of the design language: the accent that makes Nexus
             // look like Nexus, and nothing else. Everything about how it is painted comes from
-            // Nexus-look's `STYLE.md`.
-            nexus_look::init(cx, nexus_look::Look::new().accent(NEXUS_ACCENT));
+            // Nexus-look's `STYLE.md`. This is the logo's purple; the stored accent replaces it a
+            // moment later, when the settings sheet's value is loaded (`NexusApp::new`).
+            nexus_look::init(cx, nexus_look::Look::new().accent(settings::DEFAULT_ACCENT));
 
             let bounds = Bounds::centered(None, size(px(960.0), px(660.0)), cx);
             cx.open_window(
