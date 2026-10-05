@@ -9,8 +9,8 @@
 ## 项目概览
 
 **Nexus** —— Windows 桌面下载管理器。UI 用 GPUI-CE（纯 Rust GPU 框架），下载由 aria2 完成：
-默认 Nexus 自己拉起一个私有的 `aria2c.exe`（随 app 退出）；设置里也可以改成**连一个已经在跑的
-实例** —— 那种情况 Nexus 只连、不启动也不关闭它（见「aria2 坑」第 5 条）。
+默认 Nexus 自己拉起一个 `aria2c.exe`（**只听 `127.0.0.1:6800`、不设密钥**、随 app 退出）；设置里
+也可以改成**连一个已经在跑的实例** —— 那种情况 Nexus 只连、不启动也不关闭它（见「aria2 坑」第 5 条）。
 
 一个原生 GUI 可执行文件，无 Electron、无内置浏览器、无常驻 daemon。
 
@@ -196,14 +196,16 @@ STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同�
 
 ## aria2 坑
 
-结论写在 `README.md` 的 “Engine notes”。最容易忘的三条：
+结论写在 `README.md` 的 “Engine notes”。最容易忘的几条：
 
 1. **`system.multicall` 的 token 要放在每个子调用里**，放顶层会得到
    `HTTP 400 "The parameter at 0 has wrong type."`
 2. **JSON-RPC 报错走 HTTP 400**，客户端若把 4xx 当错误就会吞掉真实原因
    （已设 `http_status_as_error(false)`）。
 3. **必须 `--no-conf=true`**，否则读用户自己的 `aria2.conf`（Motrix 就在跑一个自己的
-   aria2，端口 16800）。我们用随机端口 + 每次启动随机 secret + `--stop-with-process`。
+   aria2，端口 16800）。默认绑定 **6800 + 不设 `--rpc-secret` + `--rpc-listen-all=false`**；
+   端口/密钥都在设置里可改，「监听局域网」开关把 listen-all 翻成 `true`（`0.0.0.0`）——
+   密钥留空时设置页会出红色警告。`--stop-with-process` 始终带着。
 4. 子进程用 `CREATE_NO_WINDOW` 启动，避免闪控制台。
 5. **Nexus 只关自己启动的 aria2。** `Aria2::owned` 是 `shutdown()`（从而也是 `Drop`）的开关：
    内置模式发 `aria2.shutdown`、必要时 kill；外部模式**什么都不发** —— 否则关掉 Nexus 会把

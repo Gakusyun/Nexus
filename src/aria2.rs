@@ -9,11 +9,14 @@
 //! All three RPC reads are batched into a single `system.multicall` request, which keeps
 //! the polling loop to exactly one round trip per tick.
 
+#[cfg(test)]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -123,13 +126,15 @@ pub struct Aria2 {
 /// whether a process is started at all — and with it, whose lifetime it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Connect {
-    /// Start our own `aria2c.exe`. A pinned `port`/`secret` lets outside clients follow along;
-    /// `None` keeps both random, which is the private default.
+    /// Start our own `aria2c.exe`. The port and secret come from settings (blank means aria2's
+    /// own defaults: 6800 and no secret), and `lan` decides whether it answers on `0.0.0.0` or on
+    /// loopback only.
     Builtin {
         dir: PathBuf,
         options: EngineOptions,
-        port: Option<u16>,
+        port: u16,
         secret: Option<String>,
+        lan: bool,
     },
     /// Drive an instance somebody else started. `endpoint` is already the full URL — see
     /// [`crate::settings::rpc_endpoint`] — because a bare `host:port` is a preference, not an
@@ -145,7 +150,8 @@ impl Connect {
                 options,
                 port,
                 secret,
-            } => Aria2::spawn(&dir, &options, port, secret),
+                lan,
+            } => Aria2::spawn(&dir, &options, port, secret.as_deref(), lan),
             Connect::External { endpoint, secret } => Aria2::attach(&endpoint, &secret),
         }
     }
@@ -157,34 +163,32 @@ impl Aria2 {
     /// the only place that decides *who* starts it.
     #[cfg(test)]
     pub fn start(download_dir: &Path, options: &EngineOptions) -> Result<Aria2> {
-        Self::spawn(download_dir, options, None, None)
+        // Tests get a port nothing else is using and a secret only they know, so they neither
+        // collide with a real aria2 on 6800 nor leave an engine other software can drive.
+        let port = free_port()?;
+        Self::spawn(download_dir, options, port, Some(&random_secret()), false)
     }
 
-    /// Start a private aria2 on an optional fixed port and secret. Both blank is the private
-    /// default: a free port and a fresh secret on every launch, so nothing else on the machine
-    /// can find this engine while it exists.
+    /// Start our aria2 and block until its RPC port answers.
+    ///
+    /// `secret` of `None` means no `--rpc-secret` at all — aria2's own default, not a generated
+    /// one. `lan` only changes *where the engine listens*: the handle always dials `127.0.0.1`,
+    /// because `0.0.0.0` is a thing you bind, not a thing you connect to.
     fn spawn(
         download_dir: &Path,
         options: &EngineOptions,
-        port: Option<u16>,
-        secret: Option<String>,
+        port: u16,
+        secret: Option<&str>,
+        lan: bool,
     ) -> Result<Aria2> {
         let binary = locate_binary().context(
             "aria2c.exe not found — expected it next to nexus.exe or in the `resources` folder",
         )?;
         std::fs::create_dir_all(download_dir).ok();
-
-        let port = match port {
-            Some(port) => port,
-            None => free_port()?,
-        };
-        let secret = match secret.map(|secret| secret.trim().to_string()) {
-            Some(secret) if !secret.is_empty() => secret,
-            _ => random_secret(),
-        };
+        let secret = secret.map(str::trim).filter(|secret| !secret.is_empty());
 
         let child = Command::new(&binary)
-            .args(spawn_args(port, &secret, download_dir, options))
+            .args(spawn_args(port, secret, lan, download_dir, options))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -194,7 +198,7 @@ impl Aria2 {
 
         let engine = Aria2 {
             endpoint: format!("http://127.0.0.1:{port}/jsonrpc"),
-            secret,
+            secret: secret.unwrap_or_default().to_string(),
             agent: agent(),
             child: Mutex::new(Some(child)),
             owned: true,
@@ -247,13 +251,20 @@ impl Aria2 {
     /// Single JSON-RPC call, with our token injected as the first parameter.
     pub fn call(&self, method: &str, params: Vec<Value>) -> Result<Value> {
         let mut all = Vec::with_capacity(params.len() + 1);
-        all.push(self.token());
+        if let Some(token) = self.token() {
+            all.push(token);
+        }
         all.extend(params);
         self.request(method, all)
     }
 
-    fn token(&self) -> Value {
-        Value::String(format!("token:{}", self.secret))
+    /// The token aria2 expects first, or nothing when this engine has no secret.
+    ///
+    /// An empty `token:` is not a credential, it is a lie about having one. An aria2 started
+    /// without `--rpc-secret` wants no token at all (it accepts either, but there is no reason to
+    /// send an empty one).
+    fn token(&self) -> Option<Value> {
+        (!self.secret.is_empty()).then(|| Value::String(format!("token:{}", self.secret)))
     }
 
     /// Raw JSON-RPC round trip. Used directly by `system.multicall`, which is the one
@@ -301,11 +312,13 @@ impl Aria2 {
         // `system.multicall` takes a single parameter — the list of calls — so there is
         // no room for a top-level token. Each sub-call carries its own instead; putting
         // the token at the top level makes aria2 answer HTTP 400 "parameter at 0 has
-        // wrong type".
+        // wrong type". An engine with no secret carries no token at all.
         let token = self.token();
         let sub_call = |method: &str, extra: Vec<Value>| {
             let mut params = Vec::with_capacity(extra.len() + 1);
-            params.push(token.clone());
+            if let Some(token) = &token {
+                params.push(token.clone());
+            }
             params.extend(extra);
             json!({ "methodName": method, "params": params })
         };
@@ -458,15 +471,16 @@ fn slot(slots: &[Value], index: usize) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// A loopback port that was free a moment ago. The tiny race against another process is
-/// harmless here: aria2 fails loudly and the UI reports it.
+/// A loopback port that was free a moment ago, and a secret nobody else knows. Both are for the
+/// tests only — production binds the port the settings name and hands aria2 the secret the user
+/// typed (or none at all) — so they are marked as such rather than being reachable from the app.
+#[cfg(test)]
 fn free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").context("no free loopback port")?;
     Ok(listener.local_addr()?.port())
 }
 
-/// Not a security boundary — aria2 is bound to loopback and lives only as long as the
-/// app — just enough to keep other local software from poking our queue.
+#[cfg(test)]
 fn random_secret() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -475,7 +489,15 @@ fn random_secret() -> String {
     format!("{nanos:x}{:x}", std::process::id())
 }
 
-fn spawn_args(port: u16, secret: &str, dir: &Path, options: &EngineOptions) -> Vec<String> {
+/// What the engine is started with. `secret` of `None` omits `--rpc-secret` entirely (aria2's
+/// own default), and `lan` only ever widens the *bind*: the handle dials `127.0.0.1` either way.
+fn spawn_args(
+    port: u16,
+    secret: Option<&str>,
+    lan: bool,
+    dir: &Path,
+    options: &EngineOptions,
+) -> Vec<String> {
     let user_agent = options
         .user_agent
         .clone()
@@ -485,9 +507,10 @@ fn spawn_args(port: u16, secret: &str, dir: &Path, options: &EngineOptions) -> V
         // Ignore any aria2.conf the user may have, so behaviour is reproducible.
         "--no-conf=true".to_string(),
         "--enable-rpc=true".to_string(),
-        "--rpc-listen-all=false".to_string(),
+        // The switch's answer: loopback only unless the user opened it up. `false` is aria2's
+        // own default, but it is written down here so what runs is what the sheet said.
+        format!("--rpc-listen-all={lan}"),
         format!("--rpc-listen-port={port}"),
-        format!("--rpc-secret={secret}"),
         format!("--dir={}", dir.display()),
         // Die with the app instead of being orphaned into the background.
         format!("--stop-with-process={}", std::process::id()),
@@ -512,6 +535,11 @@ fn spawn_args(port: u16, secret: &str, dir: &Path, options: &EngineOptions) -> V
         "--console-log-level=error".to_string(),
         format!("--user-agent={user_agent}"),
     ];
+    // No secret is not the same as an empty one: leaving it out is aria2's own default, and it
+    // is what lets an outside client connect without proving it knows something.
+    if let Some(secret) = secret {
+        args.push(format!("--rpc-secret={secret}"));
+    }
     if let Some(proxy) = &options.proxy {
         args.push(format!("--all-proxy={proxy}"));
     }
@@ -692,7 +720,7 @@ mod tests {
             timeout: 45,
         };
 
-        let args = spawn_args(6800, "sekret", Path::new("C:\\dl"), &engine);
+        let args = spawn_args(6800, Some("sekret"), false, Path::new("C:\\dl"), &engine);
         assert!(args.contains(&"--split=4".to_string()));
         assert!(args.contains(&"--max-connection-per-server=4".to_string()));
         assert!(args.contains(&"--max-concurrent-downloads=3".to_string()));
@@ -743,6 +771,38 @@ mod tests {
             global_options(&engine)["max-concurrent-downloads"],
             json!("3")
         );
+
+        // The LAN switch is the only thing that widens the bind, and it is written down either
+        // way — `false` is aria2's own default, but what runs must be what the sheet said.
+        assert!(args.contains(&"--rpc-listen-all=false".to_string()));
+        assert!(args.contains(&"--rpc-secret=sekret".to_string()));
+        let open = spawn_args(6800, None, true, Path::new("C:\\dl"), &engine);
+        assert!(open.contains(&"--rpc-listen-all=true".to_string()));
+        assert!(
+            open.iter().all(|arg| !arg.starts_with("--rpc-secret")),
+            "no secret means no --rpc-secret, not an empty one"
+        );
+    }
+
+    /// A blank secret is no secret: the client must not pretend to have one.
+    #[test]
+    fn no_secret_means_no_token() {
+        let dir = std::env::temp_dir().join(format!("nexus-nosecret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let port = free_port().expect("a free loopback port");
+
+        let engine = Aria2::spawn(&dir, &EngineOptions::default(), port, None, false)
+            .expect("aria2 should start without a secret");
+        assert!(engine.token().is_none(), "an empty token would be a lie");
+        engine
+            .call("aria2.getVersion", vec![])
+            .expect("a token-less call is all an engine without a secret should want");
+        // The snapshot path builds its tokens separately, so it has to reach the same answer.
+        engine.snapshot().expect("multicall without a token");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -828,8 +888,9 @@ mod tests {
         let engine = Connect::Builtin {
             dir: dir.clone(),
             options: EngineOptions::default(),
-            port: Some(port),
+            port,
             secret: Some("sekret".into()),
+            lan: false,
         }
         .connect()
         .expect("should start on the pinned port");

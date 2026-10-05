@@ -22,9 +22,10 @@ Downloading works end to end, and everything is recorded.
   (English / 简体中文) — in a card over the download list, not a separate page
 * Engine settings: user agent, connections per download, simultaneous downloads, overall
   speed limit, proxy, retries and timeout — applied without restarting aria2
-* Engine choice: Nexus's own aria2c (random port and secret each launch, or a fixed pair so
-  outside clients can follow along), or an aria2 that is already running — Nexus then only
-  talks to it, and never starts or stops it
+* Engine choice: Nexus's own aria2c (default port 6800 and no secret, so an outside client
+  finds it without being told; a "Listen on the LAN" switch widens the bind from `127.0.0.1` to
+  `0.0.0.0`), or an aria2 that is already running — Nexus then only talks to it, and never
+  starts or stops it
 * Download history and an event log in SQLite (`nexus.db`)
 * History persists across restarts; unfinished downloads re-queue with `--continue`, so a
   partial file resumes instead of restarting
@@ -169,8 +170,13 @@ down:
   summed on demand (`model::total_speed`) rather than cached. It used to be cached, and the cache
   was only refreshed by a *successful poll* — so pausing a download left the old figure on screen
   until the next tick landed.
-* Nexus uses a **free random port and a per-launch secret**, and binds to loopback only, so it
-  cannot collide with an existing aria2 (Motrix runs one on port 16800).
+* **The built-in engine binds what the settings say — `127.0.0.1:6800` and no secret by
+  default.** That is aria2's own default, chosen so an outside client can find this instance
+  without configuration while everything else stays on loopback. The "Listen on the LAN" switch
+  flips `--rpc-listen-all` to `true` (`0.0.0.0`), and the sheet warns about that while the secret
+  is blank. The handle always dials `127.0.0.1` either way: `0.0.0.0` is a thing you bind, not a
+  thing you connect to. Anything else already on the port (Motrix's own aria2 sits on 16800)
+  surfaces as an engine failure with the address in the message.
 
 ## The engine: get aria2 yourself
 

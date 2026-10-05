@@ -612,13 +612,14 @@ impl NexusApp {
     /// address into the mode you are not on costs nothing, and only these can move the engine:
     /// everything else on the sheet reaches a running one through `changeGlobalOption` or
     /// `addUri`, and restarting for those would drop every active download.
-    fn endpoint(&self) -> (RpcMode, Option<String>, Option<String>) {
+    fn endpoint(&self) -> (RpcMode, Option<String>, Option<String>, bool) {
         let settings = &self.settings;
-        let address = match settings.rpc_mode {
-            RpcMode::Builtin => settings.rpc_port.clone(),
-            RpcMode::External => settings.rpc_url.clone(),
+        let (address, lan) = match settings.rpc_mode {
+            RpcMode::Builtin => (settings.rpc_port.clone(), settings.rpc_lan),
+            // The other instance binds itself; there is no setting here that could move it.
+            RpcMode::External => (settings.rpc_url.clone(), false),
         };
-        (settings.rpc_mode, settings.rpc_secret.clone(), address)
+        (settings.rpc_mode, settings.rpc_secret.clone(), address, lan)
     }
 
     /// Where the next connection should go, built from what is *saved* — the sheet previews, and
@@ -628,10 +629,11 @@ impl NexusApp {
             RpcMode::Builtin => Connect::Builtin {
                 dir: self.download_dir.clone(),
                 options: self.engine_options(),
-                // An unparseable box falls back to "any free port" rather than refusing to start;
-                // the sheet is already saying what is wrong with it.
+                // An unparseable box falls back to aria2's own port rather than refusing to
+                // start; the sheet is already saying what is wrong with it.
                 port: crate::settings::parse_port(self.settings.rpc_port.as_deref()),
-                secret: self.settings.rpc_secret.clone(),
+                secret: crate::settings::parse_secret(self.settings.rpc_secret.as_deref()),
+                lan: self.settings.rpc_lan,
             },
             RpcMode::External => Connect::External {
                 endpoint: crate::settings::rpc_endpoint(
@@ -1613,7 +1615,22 @@ impl NexusApp {
         cx.notify();
     }
 
-    /// The port box was edited. Blank is "any free port", which is the private default.
+    /// Whether the built-in engine answers on the whole network instead of on this machine.
+    ///
+    /// A preview like every other row — the bind only changes when Save reconnects, because
+    /// aria2's listening address is a command-line argument.
+    pub fn set_rpc_lan(&mut self, lan: bool, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.rpc_lan == lan {
+            return;
+        }
+        draft.rpc_lan = lan;
+        cx.notify();
+    }
+
+    /// The port box was edited. Blank is aria2's own 6800, which is what the sheet promises.
     pub fn port_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
         let next = non_empty(text);
         if let Some(draft) = self.draft.as_mut() {

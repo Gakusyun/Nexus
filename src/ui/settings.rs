@@ -10,14 +10,14 @@
 use crate::i18n::Strings;
 use crate::settings::{
     DEFAULT_ACCENT, Language, RpcMode, ThemeMode, endpoint_is_valid, font_stack, parse_accent,
-    port_is_valid,
+    parse_secret, port_is_valid,
 };
 use crate::state::{NexusApp, Panel};
 use gpui::prelude::*;
 use gpui::{AnyElement, App, ClickEvent, Context, Div, SharedString, Window, div, px};
 use nexus_look::{
-    Button, Choice, IconButton, Modal, RADIUS, Row, Segmented, SettingGroup, SwatchGrid, Theme,
-    Tone, divider, hint, icon, layout, space, subheading, text,
+    Button, Choice, IconButton, Modal, RADIUS, Row, Segmented, SettingGroup, SwatchGrid, Switch,
+    Theme, Tone, divider, hint, icon, layout, space, subheading, text,
 };
 
 use super::{CONNECTIONS, speed_options};
@@ -285,6 +285,18 @@ fn engine_group(
             );
             if !port_is_valid(settings.rpc_port.as_deref()) {
                 group = group.child(hint(strings.rpc_port_invalid, Tone::Danger, window, cx));
+            }
+            group =
+                group.child(Row::new(strings.rpc_lan, strings.rpc_lan_note).control(
+                    Switch::new("engine-lan").on(settings.rpc_lan).on_change(
+                        cx.listener(|this, lan: &bool, _, cx| this.set_rpc_lan(*lan, cx)),
+                    ),
+                ));
+            // The switch widens the bind to the network, and a blank secret leaves the door
+            // unlocked — so say it while that is the case instead of trusting two rows to be
+            // read together.
+            if settings.rpc_lan && parse_secret(settings.rpc_secret.as_deref()).is_none() {
+                group = group.child(hint(strings.rpc_lan_warn, Tone::Danger, window, cx));
             }
             group = group.child(
                 Row::new(strings.rpc_secret, strings.rpc_secret_note)

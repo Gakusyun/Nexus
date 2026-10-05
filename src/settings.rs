@@ -22,6 +22,7 @@ pub const KEY_RPC_MODE: &str = "rpc_mode";
 pub const KEY_RPC_PORT: &str = "rpc_port";
 pub const KEY_RPC_SECRET: &str = "rpc_secret";
 pub const KEY_RPC_URL: &str = "rpc_url";
+pub const KEY_RPC_LAN: &str = "rpc_lan";
 /// The single JSON blob the preferences lived in before they got their own rows.
 const KEY_LEGACY: &str = "ui";
 
@@ -37,6 +38,11 @@ pub const DEFAULT_MAX_CONCURRENT: u32 = 5;
 pub const DEFAULT_MAX_TRIES: u32 = 5;
 /// Seconds before an idle or unreachable server is given up on.
 pub const DEFAULT_TIMEOUT: u32 = 60;
+/// aria2's own RPC port: what a blank port box means.
+///
+/// Deliberately the well-known default rather than a random free one — the point of leaving the
+/// box blank is that an outside client can find this engine without being told where it is.
+pub const DEFAULT_RPC_PORT: u16 = 6800;
 
 /// Which palette to paint. `System` follows the platform's light/dark setting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -135,14 +141,18 @@ pub struct Settings {
     // ---- where the RPC lives (see `aria2::Connect`) ----
     /// Which engine Nexus talks to; [`RpcMode::Builtin`] is the private default.
     pub rpc_mode: RpcMode,
-    /// `None` takes any free port on every launch — private by construction. Set it and outside
-    /// clients can find this engine.
+    /// `None` means [`DEFAULT_RPC_PORT`] — aria2's own port, which is what leaving the box blank
+    /// asks for.
     pub rpc_port: Option<String>,
-    /// `None` mints a fresh secret on every launch. In the built-in mode it is what Nexus hands
-    /// aria2; in the external mode it is what the user hands Nexus.
+    /// `None` means no secret at all: aria2's default, and enough while the engine only ever
+    /// listens on this machine. The LAN switch is what changes that calculus, and the sheet says
+    /// so while it is on.
     pub rpc_secret: Option<String>,
     /// The instance to attach to instead of starting one. `None` while the built-in mode is on.
     pub rpc_url: Option<String>,
+    /// Whether the built-in engine answers on `0.0.0.0` instead of `127.0.0.1`. Off by default:
+    /// a door nobody may open is the safe state, and throwing it is the user's decision to make.
+    pub rpc_lan: bool,
 }
 
 impl Default for Settings {
@@ -164,6 +174,7 @@ impl Default for Settings {
             rpc_port: None,
             rpc_secret: None,
             rpc_url: None,
+            rpc_lan: false,
         }
     }
 }
@@ -224,17 +235,29 @@ impl RpcMode {
     }
 }
 
-/// Read the port box: `None` means "any free port", which is what a blank box (or no box) asks
-/// for. A number outside `1..=65535` is also `None` — the view says what is wrong with it, and
-/// the engine falls back rather than refusing to start over a typo.
-pub fn parse_port(raw: Option<&str>) -> Option<u16> {
-    raw?.trim().parse::<u16>().ok().filter(|port| *port > 0)
+/// Read the port box: whatever was typed, or [`DEFAULT_RPC_PORT`] when the box is blank or
+/// nonsense. A number outside `1..=65535` also falls back to the default — the sheet is already
+/// saying what is wrong with it, and refusing to start would punish the reader instead of the
+/// typo.
+pub fn parse_port(raw: Option<&str>) -> u16 {
+    raw.and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_RPC_PORT)
 }
 
-/// What the port box may contain: nothing, or a port. The unset case is valid so a sheet that
-/// has not been edited yet carries no warning.
+/// Whether the port box is usable: blank (so, the default) or a real port number.
 pub fn port_is_valid(raw: Option<&str>) -> bool {
-    raw.is_none_or(|raw| raw.trim().is_empty() || parse_port(Some(raw)).is_some())
+    raw.is_none_or(|raw| raw.trim().is_empty() || raw.trim().parse::<u16>().is_ok_and(|p| p > 0))
+}
+
+/// The secret box: trimmed, and blank means *none*.
+///
+/// None is aria2's own default, not a value Nexus invents for the user — a secret nobody outside
+/// can know is not a secret, it is an unexplained connection failure waiting to happen.
+pub fn parse_secret(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(str::to_string)
 }
 
 /// What a user typed → the URL aria2 actually answers on.
@@ -327,6 +350,7 @@ impl Settings {
         ] {
             *slot = store.setting(key).filter(|value| !value.is_empty());
         }
+        settings.rpc_lan = store.setting(KEY_RPC_LAN).is_some_and(|raw| raw == "true");
         settings
     }
 
@@ -345,6 +369,9 @@ impl Settings {
             (KEY_MAX_TRIES, self.max_tries.to_string()),
             (KEY_TIMEOUT, self.timeout.to_string()),
             (KEY_RPC_MODE, self.rpc_mode.as_str().to_string()),
+            // Booleans are always written: "off" is a fact about the preference, not the absence
+            // of one, and a row a client can read as `false` beats a row that is not there.
+            (KEY_RPC_LAN, self.rpc_lan.to_string()),
         ];
         let mut removes: Vec<&str> = Vec::new();
         for (key, value) in [
@@ -570,6 +597,7 @@ mod tests {
         }
         .save(&store);
         assert_eq!(store.setting(KEY_RPC_MODE).as_deref(), Some("external"));
+        assert_eq!(store.setting(KEY_RPC_LAN).as_deref(), Some("false"));
         let loaded = Settings::load(&store);
         assert_eq!(loaded.rpc_mode, RpcMode::External);
         assert_eq!(loaded.rpc_port.as_deref(), Some("6800"));
@@ -582,11 +610,14 @@ mod tests {
             rpc_port: None,
             rpc_secret: None,
             rpc_url: None,
+            rpc_lan: true,
             ..loaded
         }
         .save(&store);
         assert_eq!(store.setting(KEY_RPC_PORT), None);
         assert_eq!(store.setting(KEY_RPC_SECRET), None);
+        assert_eq!(store.setting(KEY_RPC_LAN).as_deref(), Some("true"));
+        assert!(Settings::load(&store).rpc_lan, "the switch came back on");
         assert_eq!(Settings::load(&store).rpc_mode, RpcMode::External);
 
         // A hand-edited row falls back to the private engine instead of refusing to start.
@@ -596,20 +627,26 @@ mod tests {
 
     #[test]
     fn a_port_is_optional_and_an_address_must_look_like_one() {
-        // Blank means "any free port" — the private default. A number is a port; anything else
-        // is reported by the sheet and quietly falls back at connect time.
-        assert_eq!(parse_port(None), None);
-        assert_eq!(parse_port(Some("   ")), None);
-        assert_eq!(parse_port(Some("6800")), Some(6800));
-        assert_eq!(parse_port(Some("0")), None);
-        assert_eq!(parse_port(Some("70000")), None);
-        assert_eq!(parse_port(Some("eighty")), None);
+        // Blank means the default port — aria2's own 6800, which is what an outside client goes
+        // looking for — and so does anything that is not a port.
+        assert_eq!(parse_port(None), DEFAULT_RPC_PORT);
+        assert_eq!(parse_port(Some("   ")), DEFAULT_RPC_PORT);
+        assert_eq!(parse_port(Some("6800")), 6800);
+        assert_eq!(parse_port(Some(" 7001 ")), 7001);
+        assert_eq!(parse_port(Some("0")), DEFAULT_RPC_PORT);
+        assert_eq!(parse_port(Some("70000")), DEFAULT_RPC_PORT);
+        assert_eq!(parse_port(Some("eighty")), DEFAULT_RPC_PORT);
+        // ...while the sheet still gets to say what is wrong with the box.
         assert!(port_is_valid(None));
         assert!(port_is_valid(Some("")));
         assert!(port_is_valid(Some("6800")));
         assert!(!port_is_valid(Some("0")));
         assert!(!port_is_valid(Some("eighty")));
 
+        // A blank secret is no secret, not a generated one: the default is aria2's own default.
+        assert_eq!(parse_secret(None), None);
+        assert_eq!(parse_secret(Some("   ")), None);
+        assert_eq!(parse_secret(Some(" hunter2 ")), Some("hunter2".to_string()));
         // Every spelling of an address becomes the one aria2 answers on.
         assert_eq!(
             rpc_endpoint("127.0.0.1:6800"),
