@@ -106,12 +106,12 @@ fn header(
 
     actions = actions
         .child(
-            IconButton::new("task-reveal", seq, "icons/folder.svg", muted, text)
+            IconButton::new("task-reveal", seq, nexus_look::icons::FOLDER, muted, text)
                 .hover_bg(hover_bg)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.reveal(seq, cx))),
         )
         .child(
-            IconButton::new("task-remove", seq, "icons/x.svg", muted, danger)
+            IconButton::new("task-remove", seq, nexus_look::icons::CLOSE, muted, danger)
                 .hover_bg(hover_bg)
                 .on_click(
                     cx.listener(move |this, _: &ClickEvent, _, cx| this.request_remove(seq, cx)),

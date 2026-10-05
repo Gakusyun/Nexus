@@ -276,7 +276,7 @@ fn filter_bar(
     if finished > 0 {
         right = right.child(
             Button::ghost("clear-finished", strings.clear_finished)
-                .icon("icons/trash.svg")
+                .icon(nexus_look::icons::TRASH)
                 .on_click(
                     cx.listener(|this, _: &ClickEvent, _, cx| this.request_clear_finished(cx)),
                 ),
@@ -331,7 +331,7 @@ fn engine_banner(this: &NexusApp, strings: &Strings, theme: &Theme) -> Option<An
                 .bg(wash)
                 .border_1()
                 .border_color(danger.opacity(0.28))
-                .child(icon("icons/alert.svg", 15.0, danger))
+                .child(icon(nexus_look::icons::ALERT, 15.0, danger))
                 .child(
                     div()
                         .flex()
