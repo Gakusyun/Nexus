@@ -251,7 +251,7 @@ impl Store {
             return Vec::new();
         };
         let Ok(mut statement) = conn.prepare(&format!(
-            "SELECT seq, uris, name, dir, status, total, completed, connections, error, {}
+            "SELECT seq, gid, uris, name, dir, status, total, completed, connections, error, {}
              FROM downloads WHERE is_deleted = 0 ORDER BY seq ASC",
             unix_seconds("created_at")
         )) else {
@@ -259,23 +259,27 @@ impl Store {
         };
 
         let rows = statement.query_map([], |row| {
-            let uris: String = row.get(1)?;
-            let status: String = row.get(4)?;
+            let uris: String = row.get(2)?;
+            let status: String = row.get(5)?;
             Ok(Task {
-                gid: None,
+                // The engine's name for this row, exactly as it was written. Whether that gid is
+                // still alive is not this layer's question: the built-in engine starts empty (the
+                // gid is stale and gets dropped when we connect) while an attached one may still
+                // be running it — `NexusApp::adopt` is where that is decided.
+                gid: row.get(1)?,
                 seq: row.get::<_, i64>(0)? as u64,
                 uris: serde_json::from_str(&uris).unwrap_or_default(),
-                name: row.get(2)?,
-                dir: row.get(3)?,
-                total: row.get::<_, i64>(5)? as u64,
-                completed: row.get::<_, i64>(6)? as u64,
+                name: row.get(3)?,
+                dir: row.get(4)?,
+                total: row.get::<_, i64>(6)? as u64,
+                completed: row.get::<_, i64>(7)? as u64,
                 speed: 0,
                 // An unknown status means the row was written by a newer version; treat it
                 // as paused so the user can act on it instead of losing the row.
                 status: Status::parse(&status).unwrap_or(Status::Paused),
-                connections: row.get::<_, i64>(7)? as u64,
-                error: row.get(8)?,
-                created_at: row.get(9)?,
+                connections: row.get::<_, i64>(8)? as u64,
+                error: row.get(9)?,
+                created_at: row.get(10)?,
             })
         });
 
@@ -694,6 +698,9 @@ mod tests {
             task.completed = 1024;
             task.status = Status::Active;
             task.connections = 8;
+            // The engine's name for this row comes back with it: an attached engine may still be
+            // running that gid, and only the connect path can tell the two apart.
+            task.gid = Some("0000000000000001".to_string());
             store.upsert_download(&task, task.created_at);
         }
 
@@ -708,8 +715,7 @@ mod tests {
         assert_eq!(task.completed, 1024);
         assert_eq!(task.status, Status::Active);
         assert_eq!(task.connections, 8);
-        // Restored rows never carry a gid: aria2 is restarted with the app.
-        assert_eq!(task.gid, None);
+        assert_eq!(task.gid.as_deref(), Some("0000000000000001"));
     }
 
     #[test]

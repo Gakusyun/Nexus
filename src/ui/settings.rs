@@ -8,7 +8,10 @@
 //! could own.
 
 use crate::i18n::Strings;
-use crate::settings::{DEFAULT_ACCENT, Language, ThemeMode, font_stack, parse_accent};
+use crate::settings::{
+    DEFAULT_ACCENT, Language, RpcMode, ThemeMode, endpoint_is_valid, font_stack, parse_accent,
+    port_is_valid,
+};
 use crate::state::{NexusApp, Panel};
 use gpui::prelude::*;
 use gpui::{AnyElement, App, ClickEvent, Context, Div, SharedString, Window, div, px};
@@ -254,8 +257,58 @@ fn engine_group(
             )
         })
         .collect();
+    let rpc: Vec<_> = RpcMode::ALL
+        .iter()
+        .map(|&mode| {
+            let label = match mode {
+                RpcMode::Builtin => strings.rpc_builtin,
+                RpcMode::External => strings.rpc_external,
+            };
+            Choice::new(
+                label,
+                this.active_settings().rpc_mode == mode,
+                cx.listener(move |this, _: &ClickEvent, _, cx| this.set_rpc_mode(mode, cx)),
+            )
+        })
+        .collect();
 
-    SettingGroup::new(strings.section_engine, strings.engine_summary)
+    // The switch comes first: it decides *which* engine the rest of the sheet is configuring,
+    // and the two modes do not share their address rows — an attached engine has no port to bind.
+    let mut group = SettingGroup::new(strings.section_engine, strings.engine_summary).child(
+        Row::new(strings.rpc, strings.rpc_note).control(Segmented::new("engine-rpc").choices(rpc)),
+    );
+    let settings = this.active_settings();
+    match settings.rpc_mode {
+        RpcMode::Builtin => {
+            group = group.child(
+                Row::new(strings.rpc_port, strings.rpc_port_note).control(this.port_input.clone()),
+            );
+            if !port_is_valid(settings.rpc_port.as_deref()) {
+                group = group.child(hint(strings.rpc_port_invalid, Tone::Danger, window, cx));
+            }
+            group = group.child(
+                Row::new(strings.rpc_secret, strings.rpc_secret_note)
+                    .control(this.secret_input.clone()),
+            );
+        }
+        RpcMode::External => {
+            group = group.child(
+                Row::new(strings.rpc_url, strings.rpc_url_note).control(this.url_input.clone()),
+            );
+            // Only an address that was actually typed can be wrong; an untouched box is the
+            // placeholder, and the engine banner will explain a blank one after Save.
+            let typed = settings.rpc_url.as_deref().unwrap_or_default();
+            if !typed.trim().is_empty() && !endpoint_is_valid(typed) {
+                group = group.child(hint(strings.rpc_url_invalid, Tone::Danger, window, cx));
+            }
+            group = group.child(
+                Row::new(strings.rpc_secret, strings.rpc_secret_external_note)
+                    .control(this.secret_input.clone()),
+            );
+        }
+    }
+
+    group
         .child(Row::new(strings.user_agent, strings.user_agent_note).control(this.ua_input.clone()))
         .child(
             Row::new(strings.connections, strings.connections_note)

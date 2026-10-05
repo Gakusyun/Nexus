@@ -1,8 +1,10 @@
 //! Owns the bundled `aria2c.exe` process and speaks JSON-RPC to it.
 //!
-//! Nexus never talks to the network itself: every transfer is executed by aria2. We
-//! start a *private* instance bound to loopback with a per-launch secret, so it cannot
-//! collide with a user's own aria2 setup, and control it over HTTP JSON-RPC.
+//! Nexus never talks to the network itself: every transfer is executed by aria2. By default it
+//! starts a *private* instance bound to loopback with a per-launch secret, so it cannot collide
+//! with a user's own aria2 setup. It can also attach to an instance somebody else already
+//! started — see [`Connect`] — and that one distinction (did we start it?) decides everything
+//! about how the process is treated afterwards.
 //!
 //! All three RPC reads are batched into a single `system.multicall` request, which keeps
 //! the polling loop to exactly one round trip per tick.
@@ -37,6 +39,11 @@ const WAITING_WINDOW: u32 = 100;
 
 /// How many finished downloads we keep pulling into the list.
 const STOPPED_WINDOW: u32 = 100;
+
+/// How many times the built-in engine is asked whether it is listening yet (× 100 ms).
+const BUILTIN_ATTEMPTS: u32 = 80;
+/// The same budget for an instance Nexus only borrowed: it is already running or it is not.
+const ATTACH_ATTEMPTS: u32 = 3;
 
 /// One poll's worth of engine truth.
 pub struct Snapshot {
@@ -106,20 +113,75 @@ pub struct Aria2 {
     secret: String,
     agent: ureq::Agent,
     child: Mutex<Option<Child>>,
+    /// Whether Nexus started this process and may therefore end it. An engine that was merely
+    /// attached to belongs to somebody else, and [`Aria2::shutdown`] must not touch it — that is
+    /// what makes `Drop` safe in both modes.
+    owned: bool,
+}
+
+/// How Nexus gets to an engine. Built from settings, so `connect` is the one place that decides
+/// whether a process is started at all — and with it, whose lifetime it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Connect {
+    /// Start our own `aria2c.exe`. A pinned `port`/`secret` lets outside clients follow along;
+    /// `None` keeps both random, which is the private default.
+    Builtin {
+        dir: PathBuf,
+        options: EngineOptions,
+        port: Option<u16>,
+        secret: Option<String>,
+    },
+    /// Drive an instance somebody else started. `endpoint` is already the full URL — see
+    /// [`crate::settings::rpc_endpoint`] — because a bare `host:port` is a preference, not an
+    /// address the transport can dial.
+    External { endpoint: String, secret: String },
+}
+
+impl Connect {
+    pub fn connect(self) -> Result<Aria2> {
+        match self {
+            Connect::Builtin {
+                dir,
+                options,
+                port,
+                secret,
+            } => Aria2::spawn(&dir, &options, port, secret),
+            Connect::External { endpoint, secret } => Aria2::attach(&endpoint, &secret),
+        }
+    }
 }
 
 impl Aria2 {
-    /// Spawn aria2 and block until its RPC port answers. Call this from a background
-    /// executor — it deliberately waits for readiness so callers never see a
-    /// half-started engine.
+    /// Spawn aria2 and block until its RPC port answers. Kept for tests that need an engine
+    /// without describing where it came from; production code goes through [`Connect`], which is
+    /// the only place that decides *who* starts it.
+    #[cfg(test)]
     pub fn start(download_dir: &Path, options: &EngineOptions) -> Result<Aria2> {
+        Self::spawn(download_dir, options, None, None)
+    }
+
+    /// Start a private aria2 on an optional fixed port and secret. Both blank is the private
+    /// default: a free port and a fresh secret on every launch, so nothing else on the machine
+    /// can find this engine while it exists.
+    fn spawn(
+        download_dir: &Path,
+        options: &EngineOptions,
+        port: Option<u16>,
+        secret: Option<String>,
+    ) -> Result<Aria2> {
         let binary = locate_binary().context(
             "aria2c.exe not found — expected it next to nexus.exe or in the `resources` folder",
         )?;
         std::fs::create_dir_all(download_dir).ok();
 
-        let port = free_port()?;
-        let secret = random_secret();
+        let port = match port {
+            Some(port) => port,
+            None => free_port()?,
+        };
+        let secret = match secret.map(|secret| secret.trim().to_string()) {
+            Some(secret) if !secret.is_empty() => secret,
+            _ => random_secret(),
+        };
 
         let child = Command::new(&binary)
             .args(spawn_args(port, &secret, download_dir, options))
@@ -133,27 +195,39 @@ impl Aria2 {
         let engine = Aria2 {
             endpoint: format!("http://127.0.0.1:{port}/jsonrpc"),
             secret,
-            agent: ureq::Agent::new_with_config(
-                ureq::Agent::config_builder()
-                    .timeout_global(Some(Duration::from_secs(10)))
-                    // aria2 reports JSON-RPC failures (bad gid, unknown method...) with
-                    // HTTP 400 and a JSON error body. Without this, ureq turns those
-                    // into an opaque "http status: 400" and the real message is lost.
-                    .http_status_as_error(false)
-                    .build(),
-            ),
+            agent: agent(),
             child: Mutex::new(Some(child)),
+            owned: true,
         };
 
-        engine.wait_until_ready()?;
+        engine.wait_until_ready(BUILTIN_ATTEMPTS)?;
         Ok(engine)
     }
 
-    fn wait_until_ready(&self) -> Result<()> {
+    /// Take over an instance that is already running. Nothing is spawned and — this is the whole
+    /// point — nothing is stopped when this handle goes away: it was started by someone else and
+    /// they are still responsible for it.
+    pub fn attach(endpoint: &str, secret: &str) -> Result<Aria2> {
+        let engine = Aria2 {
+            endpoint: endpoint.to_string(),
+            secret: secret.trim().to_string(),
+            agent: agent(),
+            child: Mutex::new(None),
+            owned: false,
+        };
+        engine.wait_until_ready(ATTACH_ATTEMPTS)?;
+        Ok(engine)
+    }
+
+    /// Block until `getVersion` answers, giving up after `attempts` × 100 ms.
+    ///
+    /// A private engine gets 80 of them: a cold start on a loaded machine can take a moment.
+    /// An attached one gets 3 — if it is not already listening nothing here will change that,
+    /// and each attempt can otherwise spend the whole request timeout on an address that simply
+    /// drops the packet.
+    fn wait_until_ready(&self, attempts: u32) -> Result<()> {
         let mut last = None;
-        // aria2 usually binds the port within ~150 ms; 8 s of patience covers a cold
-        // start on a loaded machine.
-        for _ in 0..80 {
+        for _ in 0..attempts {
             match self.call("aria2.getVersion", vec![]) {
                 Ok(_) => return Ok(()),
                 Err(err) => {
@@ -163,10 +237,11 @@ impl Aria2 {
             }
         }
         self.kill();
-        Err(anyhow!(
-            "aria2 did not start listening ({})",
-            last.unwrap_or_else(|| "unknown error".into())
-        ))
+        let detail = match last {
+            Some(detail) => format!(": {detail}"),
+            None => String::new(),
+        };
+        Err(anyhow!("no answer from {}{}", self.endpoint, detail))
     }
 
     /// Single JSON-RPC call, with our token injected as the first parameter.
@@ -307,7 +382,14 @@ impl Aria2 {
     }
 
     /// Best-effort orderly shutdown, escalating to a kill if aria2 dawdles.
+    ///
+    /// An attached engine is not ours to stop: `aria2.shutdown` would end downloads Nexus does
+    /// not own, and nobody would be left to restart the process. Doing nothing is the correct
+    /// behaviour here, and it is what makes `Drop` safe in both modes.
     pub fn shutdown(&self) {
+        if !self.owned {
+            return;
+        }
         let _ = self.call("aria2.shutdown", vec![]);
         let Some(mut child) = self.child.lock().ok().and_then(|mut c| c.take()) else {
             return;
@@ -334,6 +416,36 @@ impl Drop for Aria2 {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Whether an engine entry could be the download behind `uris`.
+///
+/// aria2 spells a task's sources as `files[].uris[].uri`, and a torrent has no single URI to
+/// quote — so this is containment ("one of ours appears in there"), not equality. It is what lets
+/// a restarted Nexus recognise downloads an engine it did not start began before it opened.
+pub fn quotes_any(uris: &[String], entry: &Value) -> bool {
+    entry["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file["uris"].as_array())
+        .flatten()
+        .filter_map(|source| source["uri"].as_str())
+        .any(|source| uris.iter().any(|uri| uri == source))
+}
+
+/// The HTTP client every call goes through.
+///
+/// `http_status_as_error(false)` because aria2 reports JSON-RPC failures (bad gid, unknown
+/// method…) as HTTP 400 with a JSON error body; without it ureq turns those into an opaque
+/// "http status: 400" and the real message is lost.
+fn agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .build(),
+    )
 }
 
 /// `system.multicall` wraps each result in a one-element array, or swaps in a fault
@@ -663,5 +775,109 @@ mod tests {
 
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The borrowed case: a handle attached to an engine it did not start must not be able to
+    /// stop it by going away.
+    #[test]
+    fn an_attached_handle_does_not_own_the_engine() {
+        let dir = std::env::temp_dir().join(format!("nexus-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Stand in for "somebody else's aria2": it happens to be started here, but the handle
+        // below only borrows it — which is exactly the external mode's arrangement.
+        let host = Aria2::start(&dir, &EngineOptions::default()).expect("aria2 should start");
+        let client = Aria2::attach(&host.endpoint, &host.secret).expect("should attach");
+        assert!(!client.owned);
+        client
+            .call("aria2.getVersion", vec![])
+            .expect("the token works");
+        drop(client);
+
+        // The borrow went away and the engine must still answer. If `Drop` shut it down, closing
+        // Nexus would take Motrix's aria2 — and its other downloads — with it.
+        host.call("aria2.getVersion", vec![])
+            .expect("the engine still answers after the client is gone");
+
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreachable_engine_names_the_address_it_tried() {
+        let error = Aria2::attach("http://127.0.0.1:1/jsonrpc", "")
+            .err()
+            .expect("nothing is listening there")
+            .to_string();
+        assert!(error.contains("127.0.0.1:1"), "message: {error}");
+    }
+
+    /// The whole ownership contract in one go: a pinned port and secret are real (an outside
+    /// client can use them), the borrowed handle leaves the engine alone, and the owner still
+    /// takes it down on the way out.
+    #[test]
+    fn a_pinned_engine_is_shared_but_only_stopped_by_its_owner() {
+        let dir = std::env::temp_dir().join(format!("nexus-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Pinned to a port that was free a moment ago — the same race the app accepts when the
+        // user fixes a port in the settings sheet.
+        let port = free_port().expect("a free loopback port");
+
+        let engine = Connect::Builtin {
+            dir: dir.clone(),
+            options: EngineOptions::default(),
+            port: Some(port),
+            secret: Some("sekret".into()),
+        }
+        .connect()
+        .expect("should start on the pinned port");
+        assert_eq!(engine.endpoint, format!("http://127.0.0.1:{port}/jsonrpc"));
+        assert!(engine.owned);
+
+        // How Nexus reaches an engine someone else started — here, its own, which is the same
+        // wire protocol either way.
+        let client = Connect::External {
+            endpoint: engine.endpoint.clone(),
+            secret: "sekret".into(),
+        }
+        .connect()
+        .expect("the pinned port and secret should let a client in");
+        drop(client);
+        engine
+            .call("aria2.getVersion", vec![])
+            .expect("the borrowed handle must not stop the engine");
+
+        // The owner goes; so does the engine. Otherwise Nexus would leak an aria2c.exe per
+        // settings change.
+        drop(engine);
+        let gone = Connect::External {
+            endpoint: format!("http://127.0.0.1:{port}/jsonrpc"),
+            secret: "sekret".into(),
+        }
+        .connect()
+        .err()
+        .map(|_| ())
+        .is_some();
+        assert!(gone, "the owner should have stopped it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_download_is_recognised_by_the_uris_it_carries() {
+        let entry = json!({
+            "gid": "abc",
+            "files": [{"uris": [{"uri": "https://example.com/a.bin"}]}]
+        });
+        assert!(quotes_any(&["https://example.com/a.bin".into()], &entry));
+        assert!(!quotes_any(&["https://example.com/b.bin".into()], &entry));
+        assert!(!quotes_any(&[], &entry));
+        // An entry with no files at all is nobody's download.
+        assert!(!quotes_any(
+            &["https://example.com/a.bin".into()],
+            &json!({})
+        ));
     }
 }

@@ -15,10 +15,10 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::aria2::{Aria2, DownloadRequest, EngineOptions, Snapshot};
+use crate::aria2::{Aria2, Connect, DownloadRequest, EngineOptions, Snapshot, quotes_any};
 use crate::i18n::{self, Strings};
 use crate::model::{Status, Task, fmt_size, total_speed};
-use crate::settings::{Language, Settings, ThemeMode, font_stack};
+use crate::settings::{Language, RpcMode, Settings, ThemeMode, font_stack};
 use crate::store::{Event, Store};
 // The stored `ThemeMode` is this app's — it has a serde shape for the legacy importer. The
 // library's has the same three names and no persistence, which is the right split: how a
@@ -245,6 +245,20 @@ pub struct NexusApp {
     pub ua_input: Entity<TextInput>,
     /// Likewise for the proxy box.
     pub proxy_input: Entity<TextInput>,
+    /// The RPC port box: a fixed port so outside clients can find the built-in engine. Blank is
+    /// "any free one", which keeps the engine private unless the user says otherwise.
+    pub port_input: Entity<TextInput>,
+    /// The address of an engine Nexus does not start. It has a box of its own rather than
+    /// sharing the port box, so switching the engine switch swaps the row instead of quietly
+    /// carrying text from one meaning into the other.
+    pub url_input: Entity<TextInput>,
+    /// The shared secret: what Nexus hands the engine it starts, or what it hands an engine that
+    /// is already running.
+    pub secret_input: Entity<TextInput>,
+    /// Which connection is allowed to install itself. Bumped every time the sheet asks for a new
+    /// one, so a Save that arrives while the previous attempt is still in flight loses instead of
+    /// racing it — the loser's result is dropped rather than laid over the winner's.
+    connection_generation: u32,
     /// Which of the sheet's panels is showing, if any.
     ///
     /// One `Option` rather than a flag per panel because the two are mutually exclusive: opening
@@ -376,14 +390,37 @@ impl NexusApp {
             Self::settings_field(cx, strings.proxy_placeholder, |this, text, _, cx| {
                 this.proxy_text_changed(text, cx)
             });
+        let port_input =
+            Self::settings_field(cx, strings.rpc_port_placeholder, |this, text, _, cx| {
+                this.port_text_changed(text, cx)
+            });
+        let url_input =
+            Self::settings_field(cx, strings.rpc_url_placeholder, |this, text, _, cx| {
+                this.url_text_changed(text, cx)
+            });
+        // What a blank secret means depends on which engine is in use, so the box is born with
+        // the right promise rather than with a placeholder that only fits one of them.
+        let secret_placeholder = match settings.rpc_mode {
+            RpcMode::Builtin => strings.rpc_secret_placeholder,
+            RpcMode::External => strings.rpc_secret_external_placeholder,
+        };
+        let secret_input = Self::settings_field(cx, secret_placeholder, |this, text, _, cx| {
+            this.secret_text_changed(text, cx)
+        });
         let font = settings.font.clone().unwrap_or_default();
         let user_agent = settings.user_agent.clone().unwrap_or_default();
         let proxy = settings.proxy.clone().unwrap_or_default();
         let accent = format!("#{:06x}", settings.accent);
+        let port = settings.rpc_port.clone().unwrap_or_default();
+        let url = settings.rpc_url.clone().unwrap_or_default();
+        let secret = settings.rpc_secret.clone().unwrap_or_default();
         font_input.update(cx, |field, cx| field.set_text(font, cx));
         accent_input.update(cx, |field, cx| field.set_text(accent, cx));
         ua_input.update(cx, |field, cx| field.set_text(user_agent, cx));
         proxy_input.update(cx, |field, cx| field.set_text(proxy, cx));
+        port_input.update(cx, |field, cx| field.set_text(port, cx));
+        url_input.update(cx, |field, cx| field.set_text(url, cx));
+        secret_input.update(cx, |field, cx| field.set_text(secret, cx));
         // Apply the stored palette before the first frame paints. The accent comes from the
         // database for the same reason the mode does: the look was installed with the logo's
         // purple before anything had read a preference.
@@ -418,6 +455,10 @@ impl NexusApp {
             panel: None,
             ua_input,
             proxy_input,
+            port_input,
+            url_input,
+            secret_input,
+            connection_generation: 0,
             fonts,
             store,
             seen,
@@ -470,32 +511,9 @@ impl NexusApp {
         app
     }
 
-    /// Start the engine, then poll it forever. Both loops end with the view.
+    /// Connect to the engine, then poll it forever. Both loops end with the view.
     fn boot(&mut self, cx: &mut Context<Self>) {
-        let dir = self.download_dir.clone();
-        let options = self.engine_options();
-        cx.spawn(async move |this, cx| {
-            let started = cx
-                .background_spawn(async move { Aria2::start(&dir, &options) })
-                .await;
-            this.update(cx, |this, cx| {
-                match started {
-                    Ok(engine) => {
-                        this.aria2 = Some(Arc::new(engine));
-                        this.engine = Engine::Online;
-                        this.store.log(Event::EngineReady, None, None, None);
-                    }
-                    Err(err) => {
-                        this.engine = Engine::Failed(format!("{err:#}"));
-                        this.store
-                            .log(Event::EngineFailed, None, None, Some(&format!("{err:#}")));
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.connect(cx);
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -539,6 +557,158 @@ impl NexusApp {
             }
         })
         .detach();
+    }
+
+    /// Make the connection the settings describe. Anything that changes those settings calls
+    /// this again rather than touching a running engine — see [`NexusApp::reconnect`].
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        let generation = self.connection_generation;
+        let plan = self.connection();
+        cx.spawn(async move |this, cx| {
+            let started = cx.background_spawn(async move { plan.connect() }).await;
+            // What the engine is already holding, read once before the poll loop starts folding
+            // it in: a row restored from the database can only be recognised while the entry is
+            // still on that first list.
+            let (engine, known) = match started {
+                Ok(engine) => {
+                    let engine = Arc::new(engine);
+                    let handle = Arc::clone(&engine);
+                    let snapshot = cx.background_spawn(async move { handle.snapshot() }).await;
+                    (Ok(engine), snapshot.ok())
+                }
+                Err(err) => (Err(err), None),
+            };
+            this.update(cx, |this, cx| {
+                // A later Save asked for a different connection; this attempt lost, and installing
+                // it would put a second engine (or the wrong one) behind the queue.
+                if this.connection_generation != generation {
+                    return;
+                }
+                match engine {
+                    Ok(engine) => {
+                        this.aria2 = Some(engine);
+                        this.engine = Engine::Online;
+                        this.adopt(known);
+                        // Spawn arguments covered the built-in engine's preferences; an attached
+                        // one has never seen them.
+                        this.apply_global_settings(cx);
+                        this.store.log(Event::EngineReady, None, None, None);
+                    }
+                    Err(err) => {
+                        this.engine = Engine::Failed(format!("{err:#}"));
+                        this.store
+                            .log(Event::EngineFailed, None, None, Some(&format!("{err:#}")));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What says *which* engine Nexus talks to — and therefore when a Save is worth
+    /// reconnecting for. Only the fields the current mode actually uses count, so typing an
+    /// address into the mode you are not on costs nothing, and only these can move the engine:
+    /// everything else on the sheet reaches a running one through `changeGlobalOption` or
+    /// `addUri`, and restarting for those would drop every active download.
+    fn endpoint(&self) -> (RpcMode, Option<String>, Option<String>) {
+        let settings = &self.settings;
+        let address = match settings.rpc_mode {
+            RpcMode::Builtin => settings.rpc_port.clone(),
+            RpcMode::External => settings.rpc_url.clone(),
+        };
+        (settings.rpc_mode, settings.rpc_secret.clone(), address)
+    }
+
+    /// Where the next connection should go, built from what is *saved* — the sheet previews, and
+    /// only Save is allowed to move Nexus to a different engine.
+    fn connection(&self) -> Connect {
+        match self.settings.rpc_mode {
+            RpcMode::Builtin => Connect::Builtin {
+                dir: self.download_dir.clone(),
+                options: self.engine_options(),
+                // An unparseable box falls back to "any free port" rather than refusing to start;
+                // the sheet is already saying what is wrong with it.
+                port: crate::settings::parse_port(self.settings.rpc_port.as_deref()),
+                secret: self.settings.rpc_secret.clone(),
+            },
+            RpcMode::External => Connect::External {
+                endpoint: crate::settings::rpc_endpoint(
+                    self.settings.rpc_url.as_deref().unwrap_or_default(),
+                ),
+                secret: self.settings.rpc_secret.clone().unwrap_or_default(),
+            },
+        }
+    }
+
+    /// Move to the connection the sheet just described.
+    ///
+    /// The old handle drops with it, which stops an engine Nexus started and leaves one it merely
+    /// borrowed alone (`Aria2::shutdown` knows the difference). The generation bump means a save
+    /// that arrives while the previous attempt is still in flight loses instead of racing it.
+    fn reconnect(&mut self, cx: &mut Context<Self>) {
+        self.connection_generation += 1;
+        // Hand the previous engine off the UI thread: letting it go means an RPC plus waiting for
+        // the process to die, which must not happen between two frames.
+        if let Some(previous) = self.aria2.take() {
+            cx.background_spawn(async move { drop(previous) }).detach();
+        }
+        self.engine = Engine::Connecting;
+        self.failures = 0;
+        self.connect(cx);
+        cx.notify();
+    }
+
+    /// Reattach rows to an engine that was already running when this app started.
+    ///
+    /// The built-in engine always answers "nothing": it starts empty, so a restored row keeps no
+    /// gid and Resume re-queues it, exactly as before. An engine Nexus did *not* start may have
+    /// been downloading since the app closed — recognising those rows is the difference between
+    /// continuing a download and queueing the same file a second time.
+    ///
+    /// Nothing here is written to the database: `flush` persists whatever the first poll says
+    /// about each row, and a gid that is lost before then is recovered by the same URI match on
+    /// the next connect.
+    fn adopt(&mut self, known: Option<Snapshot>) {
+        let Some(known) = known else {
+            return;
+        };
+        let mut claimed: HashSet<String> = HashSet::new();
+
+        // A row remembers the gid it was given. The engine either still has it — and the next poll
+        // folds its state in — or it does not, and then the gid belongs to an engine that is gone.
+        for task in &mut self.tasks {
+            let Some(gid) = task.gid.clone() else {
+                continue;
+            };
+            if known
+                .tasks
+                .iter()
+                .any(|entry| entry["gid"].as_str() == Some(gid.as_str()))
+            {
+                claimed.insert(gid);
+            } else {
+                task.gid = None;
+            }
+        }
+
+        // Rows with no gid take an entry that quotes one of their own URIs and that nobody else
+        // claimed — how a download that outlived the app is recognised again.
+        for task in self.tasks.iter_mut().filter(|task| task.gid.is_none()) {
+            let Some(entry) = known.tasks.iter().find(|entry| {
+                entry["gid"]
+                    .as_str()
+                    .is_some_and(|gid| !claimed.contains(gid))
+                    && quotes_any(&task.uris, entry)
+            }) else {
+                continue;
+            };
+            let gid = entry["gid"].as_str().expect("checked above").to_string();
+            claimed.insert(gid.clone());
+            task.gid = Some(gid);
+            task.absorb(entry);
+        }
     }
 
     // ---------------------------------------------------------------- derived data
@@ -1147,6 +1317,9 @@ impl NexusApp {
         let Some(draft) = self.draft.take() else {
             return;
         };
+        // Taken before the draft is folded in: this is what the *saved* sheet asked for, so the
+        // comparison below is the only thing that can notice it changed.
+        let endpoint = self.endpoint();
         self.settings = draft;
         if let Some(dir) = self
             .settings
@@ -1163,6 +1336,13 @@ impl NexusApp {
         // Write now rather than on the next poll tick. "Save" has to mean the bytes are on disk
         // even if the process dies a moment later, and the write is one transaction anyway.
         self.save_settings();
+        if self.endpoint() != endpoint {
+            // The engine itself moved — mode, port, secret or address. Nothing else in the sheet
+            // needs this: every other preference reaches a running engine through
+            // `changeGlobalOption` or `addUri`, and restarting for those would drop every
+            // active download.
+            self.reconnect(cx);
+        }
         self.apply_global_settings(cx);
         // A committed language change has to reach the command bar, which is older than the
         // setting it is now quoting.
@@ -1225,6 +1405,18 @@ impl NexusApp {
         self.proxy_input.update(cx, |input, cx| {
             input.set_placeholder(strings.proxy_placeholder, cx)
         });
+        self.port_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.rpc_port_placeholder, cx)
+        });
+        self.url_input.update(cx, |input, cx| {
+            input.set_placeholder(strings.rpc_url_placeholder, cx)
+        });
+        let secret = match self.settings.rpc_mode {
+            RpcMode::Builtin => strings.rpc_secret_placeholder,
+            RpcMode::External => strings.rpc_secret_external_placeholder,
+        };
+        self.secret_input
+            .update(cx, |input, cx| input.set_placeholder(secret, cx));
         if let Some(dialog) = self.add_dialog.as_ref() {
             for which in AddField::ALL {
                 let placeholder = placeholder_for(which, strings);
@@ -1242,6 +1434,9 @@ impl NexusApp {
         let user_agent = self.settings.user_agent.clone().unwrap_or_default();
         let proxy = self.settings.proxy.clone().unwrap_or_default();
         let accent = format!("#{:06x}", self.settings.accent);
+        let port = self.settings.rpc_port.clone().unwrap_or_default();
+        let url = self.settings.rpc_url.clone().unwrap_or_default();
+        let secret = self.settings.rpc_secret.clone().unwrap_or_default();
         self.font_input
             .update(cx, |input, cx| input.set_text(font, cx));
         self.accent_input
@@ -1250,6 +1445,12 @@ impl NexusApp {
             .update(cx, |input, cx| input.set_text(user_agent, cx));
         self.proxy_input
             .update(cx, |input, cx| input.set_text(proxy, cx));
+        self.port_input
+            .update(cx, |input, cx| input.set_text(port, cx));
+        self.url_input
+            .update(cx, |input, cx| input.set_text(url, cx));
+        self.secret_input
+            .update(cx, |input, cx| input.set_text(secret, cx));
     }
 
     /// The active translation table. `'static`, so callers can hold on to a string while
@@ -1395,6 +1596,47 @@ impl NexusApp {
         let next = non_empty(text);
         if let Some(draft) = self.draft.as_mut() {
             draft.proxy = next;
+        }
+        cx.notify();
+    }
+
+    /// Which engine Nexus talks to. A preview only — the mode is in `draft` while the sheet is
+    /// open, and the connection moves when Save says so.
+    pub fn set_rpc_mode(&mut self, mode: RpcMode, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        if draft.rpc_mode == mode {
+            return;
+        }
+        draft.rpc_mode = mode;
+        cx.notify();
+    }
+
+    /// The port box was edited. Blank is "any free port", which is the private default.
+    pub fn port_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let next = non_empty(text);
+        if let Some(draft) = self.draft.as_mut() {
+            draft.rpc_port = next;
+        }
+        cx.notify();
+    }
+
+    /// The address box was edited.
+    pub fn url_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let next = non_empty(text);
+        if let Some(draft) = self.draft.as_mut() {
+            draft.rpc_url = next;
+        }
+        cx.notify();
+    }
+
+    /// The secret box was edited. Blank means "a fresh one every launch" in the built-in mode and
+    /// "that engine has no secret" in the other.
+    pub fn secret_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let next = non_empty(text);
+        if let Some(draft) = self.draft.as_mut() {
+            draft.rpc_secret = next;
         }
         cx.notify();
     }
@@ -1616,6 +1858,9 @@ impl NexusApp {
             || holds(&self.accent_input)
             || holds(&self.ua_input)
             || holds(&self.proxy_input)
+            || holds(&self.port_input)
+            || holds(&self.url_input)
+            || holds(&self.secret_input)
             || self.add_dialog.as_ref().is_some_and(|dialog| {
                 AddField::ALL
                     .into_iter()

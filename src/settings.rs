@@ -18,6 +18,10 @@ pub const KEY_SPEED_LIMIT: &str = "speed_limit";
 pub const KEY_PROXY: &str = "proxy";
 pub const KEY_MAX_TRIES: &str = "max_tries";
 pub const KEY_TIMEOUT: &str = "timeout";
+pub const KEY_RPC_MODE: &str = "rpc_mode";
+pub const KEY_RPC_PORT: &str = "rpc_port";
+pub const KEY_RPC_SECRET: &str = "rpc_secret";
+pub const KEY_RPC_URL: &str = "rpc_url";
 /// The single JSON blob the preferences lived in before they got their own rows.
 const KEY_LEGACY: &str = "ui";
 
@@ -128,6 +132,17 @@ pub struct Settings {
     pub proxy: Option<String>,
     pub max_tries: u32,
     pub timeout: u32,
+    // ---- where the RPC lives (see `aria2::Connect`) ----
+    /// Which engine Nexus talks to; [`RpcMode::Builtin`] is the private default.
+    pub rpc_mode: RpcMode,
+    /// `None` takes any free port on every launch — private by construction. Set it and outside
+    /// clients can find this engine.
+    pub rpc_port: Option<String>,
+    /// `None` mints a fresh secret on every launch. In the built-in mode it is what Nexus hands
+    /// aria2; in the external mode it is what the user hands Nexus.
+    pub rpc_secret: Option<String>,
+    /// The instance to attach to instead of starting one. `None` while the built-in mode is on.
+    pub rpc_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -145,6 +160,10 @@ impl Default for Settings {
             proxy: None,
             max_tries: DEFAULT_MAX_TRIES,
             timeout: DEFAULT_TIMEOUT,
+            rpc_mode: RpcMode::default(),
+            rpc_port: None,
+            rpc_secret: None,
+            rpc_url: None,
         }
     }
 }
@@ -171,6 +190,97 @@ pub fn parse_accent(raw: &str) -> Option<u32> {
         return None;
     }
     u32::from_str_radix(raw, 16).ok()
+}
+
+/// Which aria2 Nexus talks to.
+///
+/// The default starts a private instance: it cannot fight the user's own aria2 setup, and
+/// nothing else can drive it. The other mode is for an instance somebody else already started
+/// (Motrix's, a NAS's, a box across the room) — and it changes who owns the process: Nexus may
+/// start one, but it never stops one it did not start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum RpcMode {
+    #[default]
+    Builtin,
+    External,
+}
+
+impl RpcMode {
+    pub const ALL: [RpcMode; 2] = [RpcMode::Builtin, RpcMode::External];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RpcMode::Builtin => "builtin",
+            RpcMode::External => "external",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<RpcMode> {
+        match raw {
+            "builtin" => Some(RpcMode::Builtin),
+            "external" => Some(RpcMode::External),
+            _ => None,
+        }
+    }
+}
+
+/// Read the port box: `None` means "any free port", which is what a blank box (or no box) asks
+/// for. A number outside `1..=65535` is also `None` — the view says what is wrong with it, and
+/// the engine falls back rather than refusing to start over a typo.
+pub fn parse_port(raw: Option<&str>) -> Option<u16> {
+    raw?.trim().parse::<u16>().ok().filter(|port| *port > 0)
+}
+
+/// What the port box may contain: nothing, or a port. The unset case is valid so a sheet that
+/// has not been edited yet carries no warning.
+pub fn port_is_valid(raw: Option<&str>) -> bool {
+    raw.is_none_or(|raw| raw.trim().is_empty() || parse_port(Some(raw)).is_some())
+}
+
+/// What a user typed → the URL aria2 actually answers on.
+///
+/// People write `127.0.0.1:6800`, `localhost:6800/jsonrpc`, or the whole
+/// `http://127.0.0.1:6800/jsonrpc`. aria2 only understands the last form, and guessing wrong
+/// would turn a typo into "the engine failed" instead of a form error.
+pub fn rpc_endpoint(raw: &str) -> String {
+    let text = raw.trim();
+    let with_scheme = if text.contains("://") {
+        text.to_string()
+    } else {
+        format!("http://{text}")
+    };
+    if with_scheme.ends_with("/jsonrpc") {
+        with_scheme
+    } else {
+        format!("{with_scheme}/jsonrpc")
+    }
+}
+
+/// Whether [`rpc_endpoint`] would produce something worth dialling: an http(s) scheme and a host
+/// that is actually there, with a numeric port if one is written down.
+pub fn endpoint_is_valid(raw: &str) -> bool {
+    let url = rpc_endpoint(raw);
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    // `user@host` and `[::1]:6800` are both legal, and both would fool a naive split.
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let (host, port) = match host_port.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((host, rest)) => (host, rest.strip_prefix(':')),
+            None => (rest, None),
+        },
+        None => match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        },
+    };
+    !host.trim().is_empty()
+        && port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0))
 }
 
 /// Read a numeric preference. A missing or unreadable row is `None`, so the caller keeps its
@@ -206,6 +316,17 @@ impl Settings {
         settings.speed_limit = number(store, KEY_SPEED_LIMIT).unwrap_or(0);
         settings.max_tries = number(store, KEY_MAX_TRIES).unwrap_or(DEFAULT_MAX_TRIES);
         settings.timeout = number(store, KEY_TIMEOUT).unwrap_or(DEFAULT_TIMEOUT);
+        settings.rpc_mode = store
+            .setting(KEY_RPC_MODE)
+            .and_then(|raw| RpcMode::parse(&raw))
+            .unwrap_or_default();
+        for (key, slot) in [
+            (KEY_RPC_PORT, &mut settings.rpc_port),
+            (KEY_RPC_SECRET, &mut settings.rpc_secret),
+            (KEY_RPC_URL, &mut settings.rpc_url),
+        ] {
+            *slot = store.setting(key).filter(|value| !value.is_empty());
+        }
         settings
     }
 
@@ -223,6 +344,7 @@ impl Settings {
             (KEY_SPEED_LIMIT, self.speed_limit.to_string()),
             (KEY_MAX_TRIES, self.max_tries.to_string()),
             (KEY_TIMEOUT, self.timeout.to_string()),
+            (KEY_RPC_MODE, self.rpc_mode.as_str().to_string()),
         ];
         let mut removes: Vec<&str> = Vec::new();
         for (key, value) in [
@@ -230,6 +352,9 @@ impl Settings {
             (KEY_DOWNLOAD_DIR, &self.download_dir),
             (KEY_USER_AGENT, &self.user_agent),
             (KEY_PROXY, &self.proxy),
+            (KEY_RPC_PORT, &self.rpc_port),
+            (KEY_RPC_SECRET, &self.rpc_secret),
+            (KEY_RPC_URL, &self.rpc_url),
         ] {
             match value.as_deref().filter(|value| !value.is_empty()) {
                 Some(value) => writes.push((key, value.to_string())),
@@ -430,5 +555,85 @@ mod tests {
         store.set_setting(KEY_LEGACY, "{not json");
         Settings::absorb_legacy(&store);
         assert_eq!(store.setting(KEY_LEGACY).as_deref(), Some("{not json"));
+    }
+
+    #[test]
+    fn the_rpc_connection_is_stored_as_plain_rows() {
+        let path = scratch_db("rpc");
+        let store = Store::open(path.clone());
+        Settings {
+            rpc_mode: RpcMode::External,
+            rpc_port: Some("6800".into()),
+            rpc_secret: Some("hunter2".into()),
+            rpc_url: Some("my-nas:6800".into()),
+            ..Settings::default()
+        }
+        .save(&store);
+        assert_eq!(store.setting(KEY_RPC_MODE).as_deref(), Some("external"));
+        let loaded = Settings::load(&store);
+        assert_eq!(loaded.rpc_mode, RpcMode::External);
+        assert_eq!(loaded.rpc_port.as_deref(), Some("6800"));
+        assert_eq!(loaded.rpc_secret.as_deref(), Some("hunter2"));
+        assert_eq!(loaded.rpc_url.as_deref(), Some("my-nas:6800"));
+
+        // A cleared box removes its row rather than storing an empty string, so "not set" has
+        // exactly one spelling and the mode keeps its own.
+        Settings {
+            rpc_port: None,
+            rpc_secret: None,
+            rpc_url: None,
+            ..loaded
+        }
+        .save(&store);
+        assert_eq!(store.setting(KEY_RPC_PORT), None);
+        assert_eq!(store.setting(KEY_RPC_SECRET), None);
+        assert_eq!(Settings::load(&store).rpc_mode, RpcMode::External);
+
+        // A hand-edited row falls back to the private engine instead of refusing to start.
+        store.set_setting(KEY_RPC_MODE, "turbo");
+        assert_eq!(Settings::load(&store).rpc_mode, RpcMode::Builtin);
+    }
+
+    #[test]
+    fn a_port_is_optional_and_an_address_must_look_like_one() {
+        // Blank means "any free port" — the private default. A number is a port; anything else
+        // is reported by the sheet and quietly falls back at connect time.
+        assert_eq!(parse_port(None), None);
+        assert_eq!(parse_port(Some("   ")), None);
+        assert_eq!(parse_port(Some("6800")), Some(6800));
+        assert_eq!(parse_port(Some("0")), None);
+        assert_eq!(parse_port(Some("70000")), None);
+        assert_eq!(parse_port(Some("eighty")), None);
+        assert!(port_is_valid(None));
+        assert!(port_is_valid(Some("")));
+        assert!(port_is_valid(Some("6800")));
+        assert!(!port_is_valid(Some("0")));
+        assert!(!port_is_valid(Some("eighty")));
+
+        // Every spelling of an address becomes the one aria2 answers on.
+        assert_eq!(
+            rpc_endpoint("127.0.0.1:6800"),
+            "http://127.0.0.1:6800/jsonrpc"
+        );
+        assert_eq!(
+            rpc_endpoint("localhost:6800/jsonrpc"),
+            "http://localhost:6800/jsonrpc"
+        );
+        assert_eq!(
+            rpc_endpoint("https://nas.local:6800"),
+            "https://nas.local:6800/jsonrpc"
+        );
+        assert_eq!(
+            rpc_endpoint("http://127.0.0.1:6800/jsonrpc"),
+            "http://127.0.0.1:6800/jsonrpc"
+        );
+
+        assert!(endpoint_is_valid("127.0.0.1:6800"));
+        assert!(endpoint_is_valid("[::1]:6800"));
+        assert!(endpoint_is_valid("user@nas:6800"));
+        assert!(!endpoint_is_valid(""));
+        assert!(!endpoint_is_valid("http://"), "no host to dial");
+        assert!(!endpoint_is_valid("127.0.0.1:port"));
+        assert!(!endpoint_is_valid("ftp://nas:6800"), "aria2 is not there");
     }
 }

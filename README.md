@@ -1,8 +1,9 @@
 # Nexus
 
 A small, focused download manager for Windows. The UI is [GPUI-CE](https://github.com/gpui-ce/gpui-ce)
-(Zed's GPU-accelerated Rust UI framework); every byte on the wire is moved by a separate
-`aria2c.exe` that Nexus owns, drives over JSON-RPC, and shuts down with the app.
+(Zed's GPU-accelerated Rust UI framework); every byte on the wire is moved by aria2 over
+JSON-RPC — by default a private `aria2c.exe` that Nexus starts itself and shuts down with the
+app, or an instance already running elsewhere that Nexus only talks to.
 
 No Electron, no bundled browser, no daemon to install — one native executable.
 
@@ -21,6 +22,9 @@ Downloading works end to end, and everything is recorded.
   (English / 简体中文) — in a card over the download list, not a separate page
 * Engine settings: user agent, connections per download, simultaneous downloads, overall
   speed limit, proxy, retries and timeout — applied without restarting aria2
+* Engine choice: Nexus's own aria2c (random port and secret each launch, or a fixed pair so
+  outside clients can follow along), or an aria2 that is already running — Nexus then only
+  talks to it, and never starts or stops it
 * Download history and an event log in SQLite (`nexus.db`)
 * History persists across restarts; unfinished downloads re-queue with `--continue`, so a
   partial file resumes instead of restarting
@@ -139,6 +143,17 @@ down:
   `http_status_as_error(false)` and reads the error out of the JSON body.
 * **`--no-conf=true` matters.** Without it aria2 reads the user's own `aria2.conf`, which
   silently changes behaviour. (Motrix, for instance, launches its aria2 with `--conf-path`.)
+* **Nexus only stops what it started.** The built-in engine gets `aria2.shutdown` and, if it
+  dawdles, a kill; an engine it merely attached to gets neither — `Aria2::owned` is the switch
+  `shutdown()` (and therefore `Drop`) reads. Otherwise closing Nexus would take Motrix's aria2,
+  and every download on it, with it.
+* **A borrowed engine still receives `changeGlobalOption`.** Parallel downloads and the overall
+  limit are engine-wide in aria2, so Nexus's settings reach whatever it is talking to; everything
+  else rides on `addUri` and stays per-download.
+* **Rows are reattached by gid first, then by URI.** An engine Nexus did not start may have been
+  downloading since the app closed, so at connect time `NexusApp::adopt` claims entries whose gid
+  the row remembers, then entries quoting one of the row's own URIs — a row with no match is
+  simply not running any more, and Resume queues it again.
 * **The bundled Windows build does not need a CA file** — HTTPS works out of the box, which
   is worth re-checking if the aria2 version is ever bumped.
 * **`--stop-with-process=<pid>`** keeps a stray `aria2c.exe` from surviving a crash of the GUI.

@@ -8,8 +8,9 @@
 
 ## 项目概览
 
-**Nexus** —— Windows 桌面下载管理器。UI 用 GPUI-CE（纯 Rust GPU 框架），下载由独立的
-`aria2c.exe` 完成，Nexus 自己拉起进程、用 JSON-RPC 驱动、随 app 一起退出。
+**Nexus** —— Windows 桌面下载管理器。UI 用 GPUI-CE（纯 Rust GPU 框架），下载由 aria2 完成：
+默认 Nexus 自己拉起一个私有的 `aria2c.exe`（随 app 退出）；设置里也可以改成**连一个已经在跑的
+实例** —— 那种情况 Nexus 只连、不启动也不关闭它（见「aria2 坑」第 5 条）。
 
 一个原生 GUI 可执行文件，无 Electron、无内置浏览器、无常驻 daemon。
 
@@ -147,8 +148,8 @@ STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同�
 
 ## GPUI-CE 坑（写 UI 前必读）
 
-详细分析、源码行号和最小复现都在 **`gs-issue.md`**，那里是给 skill 作者的完整报告。
-这里只列「会咬到你」的结论：
+**`gs-issue.md`** 是给 skill 作者的**新问题**报告（交出去之后就清空、编号从 #1 重新开始）；
+已交出去的那批结论已经拆成下面的条目。这里只列「会咬到你」的结论：
 
 1. **元素样式是自包含的，不从父级继承。**`compute_style_internal` 从 `Style::default()`
    起步。所以：
@@ -179,7 +180,8 @@ STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同�
 
 8. 没有内置文本输入框 —— **全 app 的输入框都是 `nexus_look::TextInput`**，库里的唯一实现：
    `id` + `track_focus` + chrome + 光标/选区/placeholder + 点击定位 + `handle_input` 全在里面，
-   调用方漏不了项（漏 `track_focus` 会静默丢键，见 `gs-issue.md` #5）；底层缓冲和 UTF-16 桥
+   调用方漏不了项（漏 `track_focus` 会静默丢键 —— 框架里它在 `elements/div.rs:777` 才把元素
+   挂进焦点派发树，漏了就只剩窗口根）；底层缓冲和 UTF-16 桥
    收在库的 `text_edit::TextEdit`。Nexus 自己不拼输入框，也**不持有 `TextEdit` / 裸
    `FocusHandle`**（老的 `ui/text_field.rs` 已删）。
    - Enter / Escape 接 `.on_submit(..)` / `.on_dismiss(..)`：`on_submit` 拿得到文本，
@@ -188,8 +190,9 @@ STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同�
    - 根视图的 `handle_keys` 只在 `NexusApp::field_focused(window, cx)` 为假时才处理按键；
      否则同一个 Enter 会把同一个动作跑两遍。
 
-**发现新的 GPUI-CE 或 skill 问题时，追加到 `gs-issue.md`**（带源码行号 + 最小复现）。
-用户会定期把它交给 skill 作者，所以要写成「对方能直接照改」的形式。
+**发现新的 GPUI-CE 或 skill 问题时，写进 `gs-issue.md`**（带源码行号 + 最小复现）。
+用户会定期把它交给 skill 作者，所以要写成「对方能直接照改」的形式；**交出去之后把文件
+清空，编号从 #1 重新开始** —— 别引用已经交出去的旧编号，对方手上那份和这份不再对齐。
 
 ## aria2 坑
 
@@ -202,6 +205,13 @@ STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同�
 3. **必须 `--no-conf=true`**，否则读用户自己的 `aria2.conf`（Motrix 就在跑一个自己的
    aria2，端口 16800）。我们用随机端口 + 每次启动随机 secret + `--stop-with-process`。
 4. 子进程用 `CREATE_NO_WINDOW` 启动，避免闪控制台。
+5. **Nexus 只关自己启动的 aria2。** `Aria2::owned` 是 `shutdown()`（从而也是 `Drop`）的开关：
+   内置模式发 `aria2.shutdown`、必要时 kill；外部模式**什么都不发** —— 否则关掉 Nexus 会把
+   用户 Motrix 的 aria2 和它正在下的东西一起带走。新建连接时同理：旧句柄要在 **UI 线程之外**
+   drop（`reconnect` 里 `background_spawn`），否则一次卡住的 RPC 会卡在两帧之间。
+6. **换引擎要代数守卫。** `connection_generation` 每次 `reconnect` 自增，`connect` 的回调里
+   不等于自己那代就直接丢弃 —— 否则连点两次保存会把两个引擎装到同一个队列上。
+   连上之后先拿一次 `snapshot` 跑 `adopt`（按 gid、再按 URI 认领已在跑的任务），才进入轮询。
 
 ## 数据库约定
 
@@ -210,6 +220,10 @@ STYLE.md        本项目怎么用 Nexus-look（规范本身在库仓库的同�
   `settings`（键值，每项偏好一行：`theme`/`accent`/`language`/`font`/`download_dir` 等；
   `accent` 存 6 位小写十六进制、不带 `#`（`parse_accent` 两种写法都认）；旧版写的
   `ui` JSON 行会在启动时一次性拆到这些键）。
+- **`gid` 是引擎的名字，不是任务的身份**（不变量第 4 条）。`load_downloads` 会把它原样读回来，
+  但能不能信由 `NexusApp::adopt` 在连接时判断：内置引擎启动时是空的 → 所有 gid 都是残留、清掉；
+  外部实例可能还在跑它 → 认领，认不出的再按 URI 认一次。认领不写库：第一个轮询会把状态写下去，
+  而在那之前丢掉的 gid 下次还能靠 URI 认回来。
 - 时间戳是 **ISO-8601 UTC 文本**（`2026-10-03T11:52:19Z`），列声明为 `TIMESTAMP`。
   SQLite 没有日期类型，只能存三种东西；在它们中间选文本，是因为它在任何客户端里都读得出是个时间，
   而且 `strftime` 能认——在 `TIMESTAMP` 的标题下塞一个整数是比那个整数本身更大的谎。
